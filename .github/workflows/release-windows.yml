@@ -31,10 +31,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "Release ${{ github.ref_name }}" \
-            --generate-notes \
-            artifacts/nscb_rust.exe
+          gh release create "${{ github.ref_name }}" --title "Release ${{ github.ref_name }}" --generate-notes artifacts/nscb_rust.exe
 
       - name: Upload EXE as Artifact
         uses: actions/upload-artifact@v4
