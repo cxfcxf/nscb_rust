@@ -1,0 +1,18 @@
+[package]
+name = "nscb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+byteorder = "1"
+aes = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+zstd = "0.13"
+indicatif = "0.17"
+tempfile = "3"
+log = "0.4"
+env_logger = "0.11"
+regex = "1.12.3"
