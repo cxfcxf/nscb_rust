@@ -289,26 +289,103 @@ fn infer_version_from_input(input_path: &str) -> Option<u32> {
 }
 
 fn split_xci(input_path: &str, output_dir: &str, ks: &KeyStore) -> Result<()> {
-    // For XCI, extract NCAs from secure partition and group by title ID
+    // For XCI, extract NCAs from secure partition and split to NSP groups.
     let mut file = BufReader::new(File::open(input_path)?);
     let xci = Xci::parse(&mut file)?;
     let secure_entries = xci.secure_nca_entries(&mut file)?;
+    let base_name = infer_game_name_from_input(input_path);
+    let guessed_version = infer_version_from_input(input_path);
 
-    let mut groups: HashMap<u64, Vec<&crate::formats::xci::SecureNcaEntry>> = HashMap::new();
+    // Build CNMT mapping: content NCA id -> title id.
+    let mut cnmt_nca_map: HashMap<String, u64> = HashMap::new();
+    let mut group_meta: HashMap<u64, SplitGroupMeta> = HashMap::new();
 
     for entry in &secure_entries {
         if let Ok(info) =
             nca::parse_nca_info(&mut file, entry.abs_offset, entry.size, &entry.name, ks)
         {
-            let base_id = info.title_id & 0xFFFFFFFFFFFFE000;
-            groups.entry(base_id).or_default().push(entry);
+            if info.content_type == Some(crate::formats::types::ContentType::Meta) {
+                if let Ok(header) =
+                    crate::formats::nca::NcaHeader::from_reader(&mut file, entry.abs_offset, ks)
+                {
+                    for sec_idx in 0..4 {
+                        let sec = &header.section_table[sec_idx];
+                        if !sec.is_present() {
+                            continue;
+                        }
+                        let sec_offset = entry.abs_offset + sec.start_offset();
+                        if let Ok(pfs) = crate::formats::pfs0::Pfs0::parse_at(&mut file, sec_offset)
+                        {
+                            for pfs_entry in &pfs.entries {
+                                if pfs_entry.name.ends_with(".cnmt") {
+                                    if let Ok(cnmt_data) =
+                                        pfs.read_file(&mut file, &pfs_entry.name)
+                                    {
+                                        if let Ok(cnmt) = Cnmt::from_bytes(&cnmt_data) {
+                                            let group_id = cnmt.title_id;
+                                            group_meta.entry(group_id).or_insert(SplitGroupMeta {
+                                                title_id: cnmt.title_id,
+                                                version: cnmt.version,
+                                                title_type: cnmt.title_type_enum(),
+                                            });
+
+                                            if let Some(meta_nca_id) =
+                                                nca_id_from_filename(&entry.name)
+                                            {
+                                                cnmt_nca_map.insert(meta_nca_id, group_id);
+                                            }
+                                            for nca_id in cnmt.nca_ids() {
+                                                cnmt_nca_map.insert(nca_id, group_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut groups: HashMap<u64, Vec<&crate::formats::xci::SecureNcaEntry>> = HashMap::new();
+
+    for entry in &secure_entries {
+        let nca_id = nca_id_from_filename(&entry.name).unwrap_or_else(|| entry.name.to_lowercase());
+        if let Ok(header) = crate::formats::nca::NcaHeader::from_reader(&mut file, entry.abs_offset, ks) {
+            // CNMT NCA should always follow its own title_id; this prevents base CNMT
+            // mapping from collapsing update CNMT into base on merged XCIs.
+            if entry.name.to_ascii_lowercase().ends_with(".cnmt.nca") {
+                groups.entry(header.title_id).or_default().push(entry);
+                continue;
+            }
+
+            if let Some(&group_id) = cnmt_nca_map.get(&nca_id) {
+                groups.entry(group_id).or_default().push(entry);
+                continue;
+            }
+
+            // Prefer rights-id title for title-key NCAs; this distinguishes patch/update.
+            let mut group_id = header.title_id;
+            if header.has_rights_id() {
+                let rights_tid = u64::from_be_bytes(header.rights_id[..8].try_into().unwrap());
+                if rights_tid != 0 {
+                    group_id = rights_tid;
+                }
+            }
+            groups.entry(group_id).or_default().push(entry);
+        } else if let Some(&group_id) = cnmt_nca_map.get(&nca_id) {
+            groups.entry(group_id).or_default().push(entry);
+        } else if let Ok(info) = nca::parse_nca_info(&mut file, entry.abs_offset, entry.size, &entry.name, ks) {
+            groups.entry(info.title_id).or_default().push(entry);
         }
     }
 
     println!("Found {} title groups in XCI", groups.len());
 
-    for (base_id, entries) in &groups {
-        let output_name = format!("{:016x}.nsp", base_id);
+    for (group_id, entries) in &groups {
+        let output_name =
+            split_output_name(*group_id, group_meta.get(group_id), &base_name, guessed_version);
         let output_path = Path::new(output_dir).join(&output_name);
         println!("Writing {} ({} NCAs)", output_name, entries.len());
 

@@ -80,10 +80,13 @@ target/release/nscb \
 
 ```bash
 target/release/nscb \
-  --splitter "merged.nsp" \
+  --splitter "merged.nsp_or_xci" \
   --keys /path/to/prod.keys \
   -o /path/to/split
 ```
+
+Note:
+- Split output format is currently `NSP` files (even when input is `XCI`).
 
 Example output names:
 - `Game Name [0100...000].nsp`
@@ -159,5 +162,6 @@ target/release/nscb \
 ## Notes
 
 - Progress bars are implemented for merge/decompress/convert/trim operations, and also for compress/split.
+- XCI split uses title-aware grouping and can produce separate base/update NSP outputs.
 - For large files, always use an output folder (`-o`) to avoid overwriting source content.
 - If `--keys` is not set, the app also checks common default key locations.
