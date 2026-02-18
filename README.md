@@ -5,10 +5,10 @@ Rust implementation of core Nintendo Switch content workflows inspired by NSC_Bu
 Implemented operations:
 - Merge (`--direct_multi`, `-d`)
 - Split (`--splitter`)
+- Create/Repack NSP from folder (`--create` + `--ifolder`)
 - Convert NSP/XCI (`--direct_creation`, `-c`)
 - Compress NSP/XCI (`--compress`, `-z`)
 - Decompress NSZ/XCZ/NCZ (`--decompress`)
-- XCI trim/super-trim/untrim (`--xci_trim`, `--xci_super_trim`, `--xci_untrim`)
 
 ## Requirements
 
@@ -85,15 +85,31 @@ target/release/nscb \
   -o /path/to/split
 ```
 
-Note:
-- Split output format is currently `NSP` files (even when input is `XCI`).
+Expected split output:
+- Creates one folder per title group (base/update/DLC), not `.nsp` files.
+- Folder names are title-aware, for example:
+  - `Hollow Knight [0100633007D48000]`
+  - `Hollow Knight [0100633007D48800][v458752][UPD]`
+- Each folder contains extracted title content files, primarily `.nca`/`.ncz`.
+- Tickets/certs are not guaranteed in split output; `--splitter` is designed for content grouping.
 
-Example output names:
-- `Game Name [0100...000].nsp`
-- `Game Name [0100...800][v458752][UPD].nsp`
-- `Game Name [0100...xxx][v...][DLC].nsp`
+### 3) Create/Repack NSP from a split folder
 
-### 3) Convert NSP -> XCI
+```bash
+target/release/nscb \
+  --create "/path/to/repacked.nsp" \
+  --ifolder "/path/to/split/Game Name [0100...000]" \
+  --keys /path/to/prod.keys
+```
+
+Expected create behavior:
+- Reads top-level files from `--ifolder`.
+- Rebuilds a single `.nsp` with deterministic packing order.
+- Typical workflow:
+  - Split merged file with `--splitter`
+  - Repack one split folder with `--create`
+
+### 4) Convert NSP -> XCI
 
 ```bash
 target/release/nscb \
@@ -103,7 +119,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 4) Convert XCI -> NSP
+### 5) Convert XCI -> NSP
 
 ```bash
 target/release/nscb \
@@ -113,7 +129,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 5) Compress NSP -> NSZ (or XCI -> XCZ)
+### 6) Compress NSP -> NSZ (or XCI -> XCZ)
 
 ```bash
 target/release/nscb \
@@ -123,7 +139,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 6) Decompress NSZ -> NSP (or XCZ -> XCI, NCZ -> NCA)
+### 7) Decompress NSZ -> NSP (or XCZ -> XCI, NCZ -> NCA)
 
 ```bash
 target/release/nscb \
@@ -132,36 +148,9 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 7) Trim XCI
-
-```bash
-target/release/nscb \
-  --xci_trim "game.xci" \
-  --keys /path/to/prod.keys \
-  -o /path/to/output
-```
-
-### 8) Super-trim XCI
-
-```bash
-target/release/nscb \
-  --xci_super_trim "game.xci" \
-  --keys /path/to/prod.keys \
-  -o /path/to/output
-```
-
-### 9) Untrim XCI (pad back to card size)
-
-```bash
-target/release/nscb \
-  --xci_untrim "game.xci" \
-  --keys /path/to/prod.keys \
-  -o /path/to/output
-```
-
 ## Notes
 
-- Progress bars are implemented for merge/decompress/convert/trim operations, and also for compress/split.
-- XCI split uses title-aware grouping and can produce separate base/update NSP outputs.
+- Progress bars are implemented for merge/decompress/convert operations, and also for compress/split.
+- Split uses title-aware grouping and writes separate base/update/DLC folders.
 - For large files, always use an output folder (`-o`) to avoid overwriting source content.
 - If `--keys` is not set, the app also checks common default key locations.

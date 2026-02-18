@@ -48,7 +48,7 @@ pub fn write_padding<W: Write>(dst: &mut W, count: u64) -> std::io::Result<()> {
     write_fill(dst, 0, count)
 }
 
-/// Write padding with a specific byte value (e.g., 0xFF for XCI untrim).
+/// Write padding with a specific byte value.
 pub fn write_fill<W: Write>(dst: &mut W, byte: u8, count: u64) -> std::io::Result<()> {
     let fill = [byte; 4096];
     let mut remaining = count;

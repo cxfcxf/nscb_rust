@@ -30,18 +30,6 @@ pub struct Args {
     #[arg(long = "direct_creation", short = 'c', num_args = 1)]
     pub direct_creation: Option<String>,
 
-    /// Trim XCI file
-    #[arg(long = "xci_trim", num_args = 1)]
-    pub xci_trim: Option<String>,
-
-    /// Super-trim XCI (minimal size)
-    #[arg(long = "xci_super_trim", num_args = 1)]
-    pub xci_super_trim: Option<String>,
-
-    /// Untrim XCI to full card size
-    #[arg(long = "xci_untrim", num_args = 1)]
-    pub xci_untrim: Option<String>,
-
     /// Compress NSP→NSZ or XCI→XCZ
     #[arg(long = "compress", short = 'z', num_args = 1)]
     pub compress: Option<String>,
@@ -111,21 +99,6 @@ pub fn dispatch(args: Args) -> Result<()> {
         return crate::ops::convert::convert(path, &output, &args.output_type, &ks);
     }
 
-    if let Some(path) = &args.xci_trim {
-        let output = make_output_path(path, &args.ofolder, &add_suffix(path, "_trimmed"));
-        return crate::ops::trim::trim(path, &output);
-    }
-
-    if let Some(path) = &args.xci_super_trim {
-        let output = make_output_path(path, &args.ofolder, &add_suffix(path, "_supertrimmed"));
-        return crate::ops::trim::super_trim(path, &output);
-    }
-
-    if let Some(path) = &args.xci_untrim {
-        let output = make_output_path(path, &args.ofolder, &add_suffix(path, "_untrimmed"));
-        return crate::ops::trim::untrim(path, &output);
-    }
-
     if let Some(path) = &args.compress {
         let output = make_output_path(path, &args.ofolder, &compress_ext(path));
         return crate::ops::compress::compress(path, &output, args.level, &ks);
@@ -156,20 +129,6 @@ fn make_output_path(_input: &str, ofolder: &Option<String>, default_name: &str) 
 fn change_ext(path: &str, new_ext: &str) -> String {
     let p = Path::new(path);
     p.with_extension(new_ext).to_string_lossy().into()
-}
-
-fn add_suffix(path: &str, suffix: &str) -> String {
-    let p = Path::new(path);
-    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = p.extension().unwrap_or_default().to_string_lossy();
-    if let Some(parent) = p.parent() {
-        parent
-            .join(format!("{}{}.{}", stem, suffix, ext))
-            .to_string_lossy()
-            .into()
-    } else {
-        format!("{}{}.{}", stem, suffix, ext)
-    }
 }
 
 fn compress_ext(path: &str) -> String {
