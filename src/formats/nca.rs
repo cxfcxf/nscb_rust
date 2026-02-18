@@ -1,5 +1,6 @@
 use std::io::{Read, Seek, SeekFrom};
 
+use crate::crypto::aes_ecb;
 use crate::crypto::aes_xts::NintendoXts;
 use crate::error::{NscbError, Result};
 use crate::formats::types::*;
@@ -143,7 +144,12 @@ impl NcaHeader {
         rights_id.copy_from_slice(&data[0x230..0x240]);
 
         // Section table (4 entries x 16 bytes at 0x240)
-        const EMPTY: SectionTableEntry = SectionTableEntry { media_start: 0, media_end: 0, _unknown1: 0, _unknown2: 0 };
+        const EMPTY: SectionTableEntry = SectionTableEntry {
+            media_start: 0,
+            media_end: 0,
+            _unknown1: 0,
+            _unknown2: 0,
+        };
         let mut section_table = [EMPTY; 4];
         for (i, entry) in section_table.iter_mut().enumerate() {
             let base = 0x240 + i * 16;
@@ -190,7 +196,11 @@ impl NcaHeader {
     /// Master key revision for key derivation (key_generation - 1, clamped to 0).
     pub fn master_key_revision(&self) -> u8 {
         let kg = self.key_generation();
-        if kg > 0 { kg - 1 } else { 0 }
+        if kg > 0 {
+            kg - 1
+        } else {
+            0
+        }
     }
 
     /// Whether this NCA uses title-key crypto (has a non-zero rights ID).
@@ -276,6 +286,84 @@ impl NcaHeader {
     pub fn raw_bytes(&self) -> &[u8] {
         &self.raw
     }
+}
+
+fn decrypt_header_for_edit(encrypted: &[u8], ks: &KeyStore) -> Result<(Vec<u8>, [u8; 32], bool)> {
+    if encrypted.len() < 0xC00 {
+        return Err(NscbError::InvalidData("NCA header too short".into()));
+    }
+
+    let header_key = ks.header_key()?;
+    let mut swapped_key = [0u8; 32];
+    swapped_key[..16].copy_from_slice(&header_key[16..]);
+    swapped_key[16..].copy_from_slice(&header_key[..16]);
+
+    let attempts = [
+        (header_key, true),
+        (header_key, false),
+        (swapped_key, true),
+        (swapped_key, false),
+    ];
+
+    for (key, le_sector) in attempts {
+        let xts = NintendoXts::new(&key)?;
+        let mut decrypted = encrypted[..0xC00].to_vec();
+        xts.decrypt_with_endian(0, &mut decrypted, le_sector);
+        if NcaHeader::from_decrypted(decrypted.clone()).is_ok() {
+            return Ok((decrypted, key, le_sector));
+        }
+    }
+
+    Err(NscbError::InvalidData(
+        "Failed to decrypt NCA header with known XTS variants".into(),
+    ))
+}
+
+/// Rewrite an encrypted NCA header for gamecard/XCI style distribution.
+///
+/// This mirrors NSC_BUILDER behavior:
+/// - set distribution type to gamecard (0x01)
+/// - clear rights ID
+/// - for rights-based NCAs, re-encrypt title key into all key area slots
+pub fn rewrite_header_for_xci(
+    encrypted_header: &[u8],
+    ks: &KeyStore,
+    title_key: Option<[u8; 16]>,
+) -> Result<Vec<u8>> {
+    let (mut dec, key, le_sector) = decrypt_header_for_edit(encrypted_header, ks)?;
+
+    let had_rights = dec[0x230..0x240].iter().any(|&b| b != 0);
+    let key_index = dec[0x207];
+    let key_generation = dec[0x206].max(dec[0x220]);
+
+    // NSC_BUILDER usually keeps digital sets as non-gamecard.
+    // Mirror that default instead of forcing 1.
+    dec[0x204] = 0x00;
+    // Clear rights ID for gamecard-style headers.
+    dec[0x230..0x240].fill(0);
+
+    if had_rights {
+        let tk = title_key.ok_or_else(|| {
+            NscbError::KeyNotFound(
+                "Missing matching ticket/titlekey for rights-based NCA while creating XCI".into(),
+            )
+        })?;
+        let mkrev = if key_generation > 0 {
+            key_generation - 1
+        } else {
+            0
+        };
+        let kak = ks.key_area_key(mkrev, key_index)?;
+        let enc_slot = aes_ecb::encrypt_block(&kak, &tk)?;
+        for i in 0..4 {
+            let base = 0x300 + i * 16;
+            dec[base..base + 16].copy_from_slice(&enc_slot);
+        }
+    }
+
+    let xts = NintendoXts::new(&key)?;
+    xts.encrypt_with_endian(0, &mut dec, le_sector);
+    Ok(dec)
 }
 
 /// Summary info for an NCA file (parsed from header).

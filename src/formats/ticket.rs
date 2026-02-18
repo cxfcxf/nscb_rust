@@ -51,21 +51,24 @@ impl Ticket {
             return Err(NscbError::InvalidData("Ticket too short".into()));
         }
 
-        let sig_type = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        // Signature type is stored little-endian in retail tickets.
+        let sig_type = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let ss = sig_size(sig_type).ok_or_else(|| {
             NscbError::InvalidData(format!("Unknown ticket signature type: 0x{:06X}", sig_type))
         })?;
 
         let sig_end = 4 + ss;
         if data.len() < sig_end {
-            return Err(NscbError::InvalidData("Ticket truncated at signature".into()));
+            return Err(NscbError::InvalidData(
+                "Ticket truncated at signature".into(),
+            ));
         }
         let signature = data[4..sig_end].to_vec();
 
         let padding = sig_padding(ss);
         let body_start = sig_end + padding;
 
-        if data.len() < body_start + 0x300 {
+        if data.len() < body_start + 0x174 {
             return Err(NscbError::InvalidData("Ticket body too short".into()));
         }
 
@@ -78,22 +81,25 @@ impl Ticket {
         )
         .into_owned();
 
-        // Title key block at +0x180, 256 bytes (we only need first 16)
+        // Title key block at +0x40 (only first 16 bytes are used by NSCB)
         let mut title_key_block = [0u8; 16];
-        title_key_block.copy_from_slice(&body[0x180..0x190]);
+        title_key_block.copy_from_slice(&body[0x40..0x50]);
 
-        // Title key type at +0x281
-        let title_key_type = body[0x281];
+        // Title key type at +0x141
+        let title_key_type = body[0x141];
 
-        // Master key revision at +0x285
-        let master_key_revision = body[0x285];
+        // Master key revision at +0x144 | +0x145 (NSCB behavior)
+        let mut master_key_revision = body[0x144] | body[0x145];
+        if master_key_revision == 0 && body.len() > 0x146 {
+            master_key_revision = body[0x145] | body[0x146];
+        }
 
-        // Rights ID at +0x2A0, 16 bytes
+        // Rights ID at +0x160
         let mut rights_id = [0u8; 16];
-        rights_id.copy_from_slice(&body[0x2A0..0x2B0]);
+        rights_id.copy_from_slice(&body[0x160..0x170]);
 
-        // Account ID at +0x290, 4 bytes
-        let account_id = u32::from_le_bytes(body[0x290..0x294].try_into().unwrap());
+        // Account ID at +0x170 (big-endian)
+        let account_id = u32::from_be_bytes(body[0x170..0x174].try_into().unwrap());
 
         Ok(Self {
             sig_type,
@@ -116,13 +122,7 @@ impl Ticket {
     }
 
     /// Decrypt the title key using the keystore.
-    /// Only works for common tickets (title_key_type == 0).
     pub fn decrypt_title_key(&self, ks: &KeyStore) -> Result<[u8; 16]> {
-        if self.title_key_type != 0 {
-            return Err(NscbError::Crypto(
-                "Cannot decrypt personalized ticket (type 1) without console keys".into(),
-            ));
-        }
         ks.decrypt_title_key(&self.title_key_block, self.master_key_revision)
     }
 
@@ -153,11 +153,7 @@ impl Ticket {
 }
 
 /// Generate a standard ticket for building NSPs.
-pub fn generate_ticket(
-    title_key: &[u8; 16],
-    rights_id: &[u8; 16],
-    key_generation: u8,
-) -> Vec<u8> {
+pub fn generate_ticket(title_key: &[u8; 16], rights_id: &[u8; 16], key_generation: u8) -> Vec<u8> {
     let mut ticket = Vec::new();
 
     // Signature type: RSA-2048 SHA-256
@@ -199,9 +195,9 @@ pub fn generate_cert() -> Vec<u8> {
 
     // CA cert
     cert[0x00..0x04].copy_from_slice(&0x00010003u32.to_be_bytes()); // RSA-4096 SHA-256
-    // ... signature and body would go here
-    // For a proper implementation, this should be the actual public cert chain
-    // For now, this is a placeholder — real certs are ~1792 bytes total
+                                                                    // ... signature and body would go here
+                                                                    // For a proper implementation, this should be the actual public cert chain
+                                                                    // For now, this is a placeholder — real certs are ~1792 bytes total
 
     cert
 }

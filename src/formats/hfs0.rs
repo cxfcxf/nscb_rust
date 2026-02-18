@@ -4,6 +4,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::crypto::hash;
 use crate::error::{NscbError, Result};
+use crate::util::align::align_up;
 
 pub const HFS0_MAGIC: &[u8; 4] = b"HFS0";
 const ENTRY_SIZE: u64 = 0x40; // 64 bytes per file entry
@@ -139,11 +140,7 @@ impl Hfs0 {
     }
 
     /// Verify the hash of a file entry.
-    pub fn verify_entry<R: Read + Seek>(
-        &self,
-        reader: &mut R,
-        entry: &Hfs0Entry,
-    ) -> Result<bool> {
+    pub fn verify_entry<R: Read + Seek>(&self, reader: &mut R, entry: &Hfs0Entry) -> Result<bool> {
         let abs_offset = self.file_abs_offset(entry);
         reader.seek(SeekFrom::Start(abs_offset))?;
 
@@ -159,9 +156,9 @@ impl Hfs0 {
 
     /// Read the full contents of a file entry.
     pub fn read_file<R: Read + Seek>(&self, reader: &mut R, name: &str) -> Result<Vec<u8>> {
-        let entry = self.find(name).ok_or_else(|| {
-            NscbError::InvalidData(format!("File '{}' not found in HFS0", name))
-        })?;
+        let entry = self
+            .find(name)
+            .ok_or_else(|| NscbError::InvalidData(format!("File '{}' not found in HFS0", name)))?;
         let abs_offset = self.file_abs_offset(entry);
         reader.seek(SeekFrom::Start(abs_offset))?;
         let mut buf = vec![0u8; entry.size as usize];
@@ -216,6 +213,12 @@ impl Hfs0Builder {
 
     /// Build the HFS0 header bytes.
     pub fn build_header(&self) -> Vec<u8> {
+        self.build_header_aligned(1)
+    }
+
+    /// Build the HFS0 header bytes, padding the string table so the
+    /// total header size is aligned to `alignment`.
+    pub fn build_header_aligned(&self, alignment: u64) -> Vec<u8> {
         let file_count = self.files.len() as u32;
 
         let mut string_table = Vec::new();
@@ -224,6 +227,18 @@ impl Hfs0Builder {
             name_offsets.push(string_table.len() as u32);
             string_table.extend_from_slice(f.name.as_bytes());
             string_table.push(0);
+        }
+
+        if alignment > 1 {
+            let raw_header_size =
+                0x10 + (self.files.len() as u64 * ENTRY_SIZE) + string_table.len() as u64;
+            let padded_size = align_up(raw_header_size, alignment);
+            if padded_size > raw_header_size {
+                string_table.resize(
+                    string_table.len() + (padded_size - raw_header_size) as usize,
+                    0,
+                );
+            }
         }
 
         let string_table_size = string_table.len() as u32;
@@ -256,5 +271,21 @@ impl Hfs0Builder {
     pub fn total_size(&self) -> u64 {
         let data_size: u64 = self.files.iter().map(|f| f.size).sum();
         self.header_size() + data_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_header_aligned_to_media_unit() {
+        let mut b = Hfs0Builder::new();
+        b.add_file("update".to_string(), 0x200, [0u8; 32], 0x200);
+        b.add_file("secure".to_string(), 0x400, [1u8; 32], 0x200);
+
+        let header = b.build_header_aligned(0x200);
+        assert_eq!(&header[0..4], HFS0_MAGIC);
+        assert_eq!(header.len() as u64 % 0x200, 0);
     }
 }
