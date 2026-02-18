@@ -351,17 +351,16 @@ fn build_xci_output(
     use crate::formats::types;
     use crate::formats::xci::{XciBuilder, XCI_PREFIX_SIZE};
 
-    let mut fallback_title_key: Option<[u8; 16]> = None;
+    let mut enc_title_keys_by_rights: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
     for tik in tickets {
         let mut src = BufReader::new(File::open(&tik.source_path)?);
         src.seek(SeekFrom::Start(tik.abs_offset))?;
         let mut raw = vec![0u8; tik.size as usize];
         src.read_exact(&mut raw)?;
         if let Ok(t) = Ticket::from_bytes(&raw) {
-            if let Ok(title_key) = t.decrypt_title_key(ks) {
-                // NSC_BUILDER behavior: use effective titlekey from ticket scan order.
-                fallback_title_key = Some(title_key);
-            }
+            enc_title_keys_by_rights
+                .entry(t.rights_id)
+                .or_insert(t.title_key_block);
         }
     }
 
@@ -382,7 +381,12 @@ fn build_xci_output(
         src.read_exact(&mut enc_header)?;
         let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
         let title_key = if parsed.has_rights_id() {
-            fallback_title_key
+            if let Some(enc_title_key) = enc_title_keys_by_rights.get(&parsed.rights_id) {
+                let mkrev = parsed.key_generation().saturating_sub(1);
+                Some(ks.decrypt_title_key(enc_title_key, mkrev)?)
+            } else {
+                None
+            }
         } else {
             None
         };

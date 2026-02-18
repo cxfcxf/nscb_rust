@@ -127,19 +127,19 @@ impl KeyStore {
             }
 
             // Derive key area keys
-            if let Some(kek_gen) = aes_kek_gen {
+            if let (Some(kek_gen), Some(key_gen)) = (aes_kek_gen, aes_key_gen) {
                 if let Some(src) = kak_app_src {
-                    if let Ok(k) = derivation::derive_key_area_key(&mk, &src, &kek_gen) {
+                    if let Ok(k) = derivation::derive_key_area_key(&mk, &src, &kek_gen, &key_gen) {
                         self.key_area_keys[i][0] = Some(k);
                     }
                 }
                 if let Some(src) = kak_ocean_src {
-                    if let Ok(k) = derivation::derive_key_area_key(&mk, &src, &kek_gen) {
+                    if let Ok(k) = derivation::derive_key_area_key(&mk, &src, &kek_gen, &key_gen) {
                         self.key_area_keys[i][1] = Some(k);
                     }
                 }
                 if let Some(src) = kak_system_src {
-                    if let Ok(k) = derivation::derive_key_area_key(&mk, &src, &kek_gen) {
+                    if let Ok(k) = derivation::derive_key_area_key(&mk, &src, &kek_gen, &key_gen) {
                         self.key_area_keys[i][2] = Some(k);
                     }
                 }
@@ -162,9 +162,10 @@ impl KeyStore {
 
     /// Get the 32-byte NCA header key.
     pub fn header_key(&self) -> Result<[u8; 32]> {
-        let v = self.raw.get("header_key").ok_or_else(|| {
-            NscbError::KeyNotFound("header_key not found in prod.keys".into())
-        })?;
+        let v = self
+            .raw
+            .get("header_key")
+            .ok_or_else(|| NscbError::KeyNotFound("header_key not found in prod.keys".into()))?;
         if v.len() != 32 {
             return Err(NscbError::KeyNotFound(format!(
                 "header_key has wrong size: {} (expected 32)",
@@ -179,9 +180,8 @@ impl KeyStore {
     /// Get master key for a given revision.
     pub fn master_key(&self, revision: u8) -> Result<[u8; 16]> {
         let name = format!("master_key_{:02x}", revision);
-        self.get_raw_16(&name).ok_or_else(|| {
-            NscbError::KeyNotFound(format!("master_key_{:02x} not found", revision))
-        })
+        self.get_raw_16(&name)
+            .ok_or_else(|| NscbError::KeyNotFound(format!("master_key_{:02x} not found", revision)))
     }
 
     /// Get pre-derived title KEK for a given revision.

@@ -44,21 +44,13 @@ impl Nsp {
     }
 
     /// Get CNMT NCA entries (NCA files whose name contains "cnmt" or content type is Meta).
-    pub fn cnmt_nca_entries<R: Read + Seek>(
-        &self,
-        reader: &mut R,
-        ks: &KeyStore,
-    ) -> Vec<NcaInfo> {
+    pub fn cnmt_nca_entries<R: Read + Seek>(&self, reader: &mut R, ks: &KeyStore) -> Vec<NcaInfo> {
         let mut result = Vec::new();
         for entry in self.nca_entries() {
             let offset = self.pfs0.file_abs_offset(entry);
-            if let Ok(info) = crate::formats::nca::parse_nca_info(
-                reader,
-                offset,
-                entry.size,
-                &entry.name,
-                ks,
-            ) {
+            if let Ok(info) =
+                crate::formats::nca::parse_nca_info(reader, offset, entry.size, &entry.name, ks)
+            {
                 if info.content_type == Some(crate::formats::types::ContentType::Meta) {
                     result.push(info);
                 }
@@ -68,16 +60,11 @@ impl Nsp {
     }
 
     /// Parse all NCA headers and return info about each.
-    pub fn nca_infos<R: Read + Seek>(
-        &self,
-        reader: &mut R,
-        ks: &KeyStore,
-    ) -> Vec<NcaInfo> {
+    pub fn nca_infos<R: Read + Seek>(&self, reader: &mut R, ks: &KeyStore) -> Vec<NcaInfo> {
         let mut result = Vec::new();
         for entry in self.nca_entries() {
             let offset = self.pfs0.file_abs_offset(entry);
-            match crate::formats::nca::parse_nca_info(reader, offset, entry.size, &entry.name, ks)
-            {
+            match crate::formats::nca::parse_nca_info(reader, offset, entry.size, &entry.name, ks) {
                 Ok(info) => result.push(info),
                 Err(e) => {
                     log::warn!("Failed to parse NCA {}: {}", entry.name, e);

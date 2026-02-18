@@ -14,9 +14,17 @@ pub struct Args {
     #[arg(long = "direct_multi", short = 'd', num_args = 1..)]
     pub direct_multi: Option<Vec<String>>,
 
-    /// Split multi-title file into separate files by title ID
+    /// Split multi-title file into separate title folders with NCA files
     #[arg(long = "splitter", num_args = 1)]
     pub splitter: Option<String>,
+
+    /// Create/repack NSP from an input folder
+    #[arg(long = "create", num_args = 1)]
+    pub create: Option<String>,
+
+    /// Input folder for --create
+    #[arg(long = "ifolder")]
+    pub ifolder: Option<String>,
 
     /// Convert NSP↔XCI
     #[arg(long = "direct_creation", short = 'c', num_args = 1)]
@@ -81,29 +89,25 @@ pub fn dispatch(args: Args) -> Result<()> {
             &args.ofolder,
             &merge_name,
         );
-        return crate::ops::merge::merge(
-            &file_refs,
-            &output,
-            &ks,
-            args.nodelta,
-            &args.output_type,
-        );
+        return crate::ops::merge::merge(&file_refs, &output, &ks, args.nodelta, &args.output_type);
     }
 
     if let Some(path) = &args.splitter {
-        let output_dir = args
-            .ofolder
-            .as_deref()
-            .unwrap_or("./split");
+        let output_dir = args.ofolder.as_deref().unwrap_or("./split");
         return crate::ops::split::split(path, output_dir, &ks);
     }
 
+    if let Some(output_path) = &args.create {
+        let input_dir = args.ifolder.as_deref().ok_or_else(|| {
+            crate::error::NscbError::InvalidData(
+                "--create requires --ifolder <input_folder>".to_string(),
+            )
+        })?;
+        return crate::ops::create::create_from_folder(input_dir, output_path, &ks);
+    }
+
     if let Some(path) = &args.direct_creation {
-        let output = make_output_path(
-            path,
-            &args.ofolder,
-            &change_ext(path, &args.output_type),
-        );
+        let output = make_output_path(path, &args.ofolder, &change_ext(path, &args.output_type));
         return crate::ops::convert::convert(path, &output, &args.output_type, &ks);
     }
 
@@ -124,7 +128,7 @@ pub fn dispatch(args: Args) -> Result<()> {
 
     if let Some(path) = &args.compress {
         let output = make_output_path(path, &args.ofolder, &compress_ext(path));
-        return crate::ops::compress::compress(path, &output, args.level);
+        return crate::ops::compress::compress(path, &output, args.level, &ks);
     }
 
     if let Some(path) = &args.decompress {
@@ -306,5 +310,8 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
         parts.join("+")
     };
 
-    format!("{} [{}] [v{}] ({}).{}", name, tid, ver, summary, output_type)
+    format!(
+        "{} [{}] [v{}] ({}).{}",
+        name, tid, ver, summary, output_type
+    )
 }

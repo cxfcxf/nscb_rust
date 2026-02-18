@@ -155,9 +155,9 @@ impl Pfs0 {
 
     /// Read the full contents of a named file.
     pub fn read_file<R: Read + Seek>(&self, reader: &mut R, name: &str) -> Result<Vec<u8>> {
-        let entry = self.find(name).ok_or_else(|| {
-            NscbError::InvalidData(format!("File '{}' not found in PFS0", name))
-        })?;
+        let entry = self
+            .find(name)
+            .ok_or_else(|| NscbError::InvalidData(format!("File '{}' not found in PFS0", name)))?;
         let abs_offset = self.file_abs_offset(entry);
         reader.seek(SeekFrom::Start(abs_offset))?;
         let mut buf = vec![0u8; entry.size as usize];
@@ -199,9 +199,9 @@ impl Pfs0Builder {
 
     /// Calculate the header size for the current file list.
     pub fn header_size(&self) -> u64 {
-        let string_table_size: u64 = self.files.iter().map(|f| (f.name.len() + 1) as u64).sum();
-        let raw = 0x10 + (self.files.len() as u64 * ENTRY_SIZE) + string_table_size;
-        align_up(raw, PFS0_ALIGN)
+        let raw_string_table_size: u64 = self.files.iter().map(|f| (f.name.len() + 1) as u64).sum();
+        let aligned_string_table_size = align_up(raw_string_table_size, PFS0_ALIGN);
+        0x10 + (self.files.len() as u64 * ENTRY_SIZE) + aligned_string_table_size
     }
 
     /// Write the PFS0 header. Returns the header bytes.
@@ -218,6 +218,12 @@ impl Pfs0Builder {
             string_table.push(0); // null terminator
         }
 
+        // Python NSC_BUILDER writes string-table size as already 0x10-aligned.
+        // Keep parity by embedding the padding inside the string table region.
+        let aligned_string_table_len = align_up(string_table.len() as u64, PFS0_ALIGN) as usize;
+        if aligned_string_table_len > string_table.len() {
+            string_table.resize(aligned_string_table_len, 0);
+        }
         let string_table_size = string_table.len() as u32;
 
         let mut header = Vec::new();
@@ -242,12 +248,6 @@ impl Pfs0Builder {
 
         // String table
         header.extend_from_slice(&string_table);
-
-        // Pad header to 0x10 alignment.
-        let padded_len = align_up(header.len() as u64, PFS0_ALIGN) as usize;
-        if padded_len > header.len() {
-            header.resize(padded_len, 0);
-        }
 
         header
     }

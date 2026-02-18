@@ -202,7 +202,10 @@ impl Cnmt {
 
     /// Content entries excluding delta fragments.
     pub fn non_delta_entries(&self) -> Vec<&ContentEntry> {
-        self.content_entries.iter().filter(|e| !e.is_delta()).collect()
+        self.content_entries
+            .iter()
+            .filter(|e| !e.is_delta())
+            .collect()
     }
 
     /// Version as a display string (major.minor.patch.revision).
@@ -244,8 +247,7 @@ mod tests {
         data[entry_offset + 0x20] = 0xAA;
         // Size at +0x30: 1MB
         let size = 1024u64 * 1024;
-        data[entry_offset + 0x30..entry_offset + 0x36]
-            .copy_from_slice(&size.to_le_bytes()[..6]);
+        data[entry_offset + 0x30..entry_offset + 0x36].copy_from_slice(&size.to_le_bytes()[..6]);
         // Content type at +0x36: Program (1)
         data[entry_offset + 0x36] = 1;
 

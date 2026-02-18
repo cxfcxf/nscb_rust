@@ -35,15 +35,11 @@ pub fn generate_kek(
 pub fn derive_title_kek(
     master_key: &[u8; 16],
     titlekek_source: &[u8; 16],
-    aes_kek_generation_source: &[u8; 16],
-    aes_key_generation_source: &[u8; 16],
+    _aes_kek_generation_source: &[u8; 16],
+    _aes_key_generation_source: &[u8; 16],
 ) -> Result<[u8; 16]> {
-    generate_kek(
-        titlekek_source,
-        master_key,
-        aes_kek_generation_source,
-        Some(aes_key_generation_source),
-    )
+    // NSC_BUILDER / hactool behavior: titlekek is directly unwrapped by master key.
+    aes_ecb::decrypt_block(master_key, titlekek_source)
 }
 
 /// Derive a key area key for a given master key revision and key type.
@@ -57,12 +53,13 @@ pub fn derive_key_area_key(
     master_key: &[u8; 16],
     key_area_source: &[u8; 16],
     aes_kek_generation_source: &[u8; 16],
+    aes_key_generation_source: &[u8; 16],
 ) -> Result<[u8; 16]> {
     generate_kek(
         key_area_source,
         master_key,
         aes_kek_generation_source,
-        None,
+        Some(aes_key_generation_source),
     )
 }
 

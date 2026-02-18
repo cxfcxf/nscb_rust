@@ -17,7 +17,10 @@ pub fn trim(input_path: &str, output_path: &str) -> Result<()> {
     let file_size = fs::metadata(input_path)?.len();
 
     if data_end >= file_size {
-        println!("XCI is already trimmed (data end: {}, file size: {})", data_end, file_size);
+        println!(
+            "XCI is already trimmed (data end: {}, file size: {})",
+            data_end, file_size
+        );
         return Ok(());
     }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -51,17 +52,16 @@ fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> 
         return Err(NscbError::InvalidData("NSP contains no NCA files".into()));
     }
 
-    let mut fallback_title_key: Option<[u8; 16]> = None;
+    let mut enc_title_keys_by_rights: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
     for tik in nsp.ticket_entries() {
         let abs_offset = nsp.file_abs_offset(tik);
         file.seek(SeekFrom::Start(abs_offset))?;
         let mut raw = vec![0u8; tik.size as usize];
         file.read_exact(&mut raw)?;
         if let Ok(t) = Ticket::from_bytes(&raw) {
-            if let Ok(title_key) = t.decrypt_title_key(ks) {
-                // NSC_BUILDER behavior: effective key is driven by ticket scan order.
-                fallback_title_key = Some(title_key);
-            }
+            enc_title_keys_by_rights
+                .entry(t.rights_id)
+                .or_insert(t.title_key_block);
         }
     }
 
@@ -82,7 +82,12 @@ fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> 
 
         let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
         let title_key = if parsed.has_rights_id() {
-            fallback_title_key
+            if let Some(enc_title_key) = enc_title_keys_by_rights.get(&parsed.rights_id) {
+                let mkrev = parsed.key_generation().saturating_sub(1);
+                Some(ks.decrypt_title_key(enc_title_key, mkrev)?)
+            } else {
+                None
+            }
         } else {
             None
         };

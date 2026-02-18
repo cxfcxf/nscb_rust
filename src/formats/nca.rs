@@ -298,6 +298,7 @@ fn decrypt_header_for_edit(encrypted: &[u8], ks: &KeyStore) -> Result<(Vec<u8>, 
     swapped_key[..16].copy_from_slice(&header_key[16..]);
     swapped_key[16..].copy_from_slice(&header_key[..16]);
 
+    // Prefer NSC_BUILDER mode first; keep fallback variants for compatibility.
     let attempts = [
         (header_key, true),
         (header_key, false),

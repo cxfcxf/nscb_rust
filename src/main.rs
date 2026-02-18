@@ -2,13 +2,13 @@
 
 use clap::Parser;
 
-mod error;
+mod cli;
 mod crypto;
-mod keys;
+mod error;
 mod formats;
+mod keys;
 mod ops;
 mod util;
-mod cli;
 
 fn main() {
     env_logger::init();

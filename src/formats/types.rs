@@ -5,7 +5,7 @@ pub enum ContentType {
     Program = 0,
     Meta = 1,
     Control = 2,
-    Manual = 3,      // HTML manual / Legal info
+    Manual = 3, // HTML manual / Legal info
     Data = 4,
     PublicData = 5,
 }
@@ -122,12 +122,12 @@ impl KeyAreaKeyType {
 /// XCI card sizes.
 pub fn xci_card_size(size_byte: u8) -> u64 {
     match size_byte {
-        0xFA => 1024 * 1024 * 1024,          // 1GB
-        0xF8 => 2 * 1024 * 1024 * 1024,      // 2GB
-        0xF0 => 4 * 1024 * 1024 * 1024,      // 4GB
-        0xE0 => 8 * 1024 * 1024 * 1024,      // 8GB
-        0xE1 => 16 * 1024 * 1024 * 1024,     // 16GB
-        0xE2 => 32 * 1024 * 1024 * 1024u64,  // 32GB
+        0xFA => 1024 * 1024 * 1024,         // 1GB
+        0xF8 => 2 * 1024 * 1024 * 1024,     // 2GB
+        0xF0 => 4 * 1024 * 1024 * 1024,     // 4GB
+        0xE0 => 8 * 1024 * 1024 * 1024,     // 8GB
+        0xE1 => 16 * 1024 * 1024 * 1024,    // 16GB
+        0xE2 => 32 * 1024 * 1024 * 1024u64, // 32GB
         _ => 0,
     }
 }

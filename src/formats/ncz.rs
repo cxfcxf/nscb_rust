@@ -12,6 +12,8 @@
 
 use std::io::{Read, Seek, SeekFrom, Write};
 
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::Aes128;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use indicatif::ProgressBar;
 
@@ -32,6 +34,12 @@ pub struct NczSection {
     pub _padding: u64,
     pub crypto_key: [u8; 16],
     pub crypto_counter: [u8; 16],
+}
+
+impl NczSection {
+    pub fn has_valid_range(&self) -> bool {
+        self.size > 0 && self.offset >= 0x4000
+    }
 }
 
 /// NCZ block table — maps compressed blocks to decompressed data.
@@ -180,7 +188,7 @@ impl NczReader {
 
 /// Decompress an NCZ file to NCA.
 /// `offset` is where the NCZ data starts in the reader.
-pub fn decompress_ncz<R: Read + Seek, W: Write>(
+pub fn decompress_ncz<R: Read + Seek, W: Read + Write + Seek>(
     reader: &mut R,
     writer: &mut W,
     total_nca_size: u64,
@@ -203,7 +211,14 @@ pub fn decompress_ncz<R: Read + Seek, W: Write>(
     } else if let Some(block_table) = &ncz.block_table {
         // Block-based: decompress individual blocks
         let block_size = 1usize << block_table.block_size_exponent;
-        decompress_blocks(reader, writer, block_table, block_size, &mut written, target)?;
+        decompress_blocks(
+            reader,
+            writer,
+            block_table,
+            block_size,
+            &mut written,
+            target,
+        )?;
     } else {
         return Err(NscbError::InvalidData(
             "NCZ has neither block table nor zstd stream".into(),
@@ -215,7 +230,67 @@ pub fn decompress_ncz<R: Read + Seek, W: Write>(
         crate::util::io::write_padding(writer, target - written)?;
     }
 
+    // Match NSC_BUILDER: NCZ payload is then transformed in-place per section.
+    // cryptoType 1: plaintext (no-op), cryptoType 3: AES-CTR transform.
+    reencrypt_sections_in_place(writer, &ncz.sections)?;
+
     Ok(())
+}
+
+fn reencrypt_sections_in_place<W: Read + Write + Seek>(
+    writer: &mut W,
+    sections: &[NczSection],
+) -> Result<()> {
+    let mut buf = vec![0u8; 0x10000];
+    for s in sections {
+        // Match python behavior:
+        // - 0 and 1 mean no post-transform for this section
+        // - 3/4 mean AES-CTR transform
+        if s.crypto_type == 0 || s.crypto_type == 1 {
+            continue;
+        }
+        if s.crypto_type != 3 && s.crypto_type != 4 {
+            return Err(NscbError::InvalidData(format!(
+                "Unsupported NCZ section crypto type {}",
+                s.crypto_type
+            )));
+        }
+
+        let cipher = Aes128::new_from_slice(&s.crypto_key)
+            .map_err(|e| NscbError::Crypto(format!("AES key init: {e}")))?;
+        let mut pos = s.offset;
+        let end = s.offset.saturating_add(s.size);
+        while pos < end {
+            let chunk_sz = (end - pos).min(buf.len() as u64) as usize;
+            writer.seek(SeekFrom::Start(pos))?;
+            writer.read_exact(&mut buf[..chunk_sz])?;
+            aes_ctr_transform_in_place(&cipher, &s.crypto_counter[..8], pos, &mut buf[..chunk_sz]);
+            writer.seek(SeekFrom::Start(pos))?;
+            writer.write_all(&buf[..chunk_sz])?;
+            pos += chunk_sz as u64;
+        }
+    }
+    Ok(())
+}
+
+fn aes_ctr_transform_in_place(cipher: &Aes128, nonce8: &[u8], file_offset: u64, data: &mut [u8]) {
+    let mut cached_block_index = u64::MAX;
+    let mut cached_keystream = [0u8; 16];
+    for (i, byte) in data.iter_mut().enumerate() {
+        let abs = file_offset + i as u64;
+        let block_index = abs / 16;
+        let byte_in_block = (abs % 16) as usize;
+        if block_index != cached_block_index {
+            let mut ctr = [0u8; 16];
+            ctr[..8].copy_from_slice(nonce8);
+            ctr[8..].copy_from_slice(&block_index.to_be_bytes());
+            let mut blk = aes::Block::from(ctr);
+            cipher.encrypt_block(&mut blk);
+            cached_keystream.copy_from_slice(&blk);
+            cached_block_index = block_index;
+        }
+        *byte ^= cached_keystream[byte_in_block];
+    }
 }
 
 /// Decompress a stream-based NCZ (single zstd stream).
@@ -225,9 +300,8 @@ fn decompress_stream<R: Read, W: Write>(
     written: &mut u64,
     target: u64,
 ) -> Result<()> {
-    let mut decoder = zstd::Decoder::new(reader).map_err(|e| {
-        NscbError::Crypto(format!("zstd decoder init error: {e}"))
-    })?;
+    let mut decoder = zstd::Decoder::new(reader)
+        .map_err(|e| NscbError::Crypto(format!("zstd decoder init error: {e}")))?;
 
     let mut buf = vec![0u8; 1024 * 1024]; // 1MB read buffer
     loop {
@@ -236,9 +310,9 @@ fn decompress_stream<R: Read, W: Write>(
         }
 
         let to_read = buf.len().min((target - *written) as usize);
-        let n = decoder.read(&mut buf[..to_read]).map_err(|e| {
-            NscbError::Crypto(format!("zstd decompress error: {e}"))
-        })?;
+        let n = decoder
+            .read(&mut buf[..to_read])
+            .map_err(|e| NscbError::Crypto(format!("zstd decompress error: {e}")))?;
 
         if n == 0 {
             break;
@@ -272,9 +346,8 @@ fn decompress_blocks<R: Read, W: Write>(
         let decompressed = if compressed_size as usize == block_size {
             compressed
         } else {
-            zstd::decode_all(&compressed[..]).map_err(|e| {
-                NscbError::Crypto(format!("zstd decompress error: {e}"))
-            })?
+            zstd::decode_all(&compressed[..])
+                .map_err(|e| NscbError::Crypto(format!("zstd decompress error: {e}")))?
         };
 
         let to_write = decompressed.len().min((target - *written) as usize);
@@ -290,50 +363,103 @@ pub fn compress_nca<R: Read + Seek, W: Write + Seek>(
     reader: &mut R,
     writer: &mut W,
     nca_size: u64,
+    sections: &[NczSection],
     compression_level: i32,
     pb: Option<&ProgressBar>,
 ) -> Result<()> {
-    reader.seek(SeekFrom::Start(0))?;
+    let nca_base = reader.stream_position()?;
 
     // Copy original NCA header (0x4000 bytes)
     let mut nca_header = vec![0u8; 0x4000];
     reader.read_exact(&mut nca_header)?;
     writer.write_all(&nca_header)?;
 
-    // Write section magic + a single data section, then a solid zstd stream.
-    // This yields better compression ratio than independent block streams.
+    // Write section magic + section table, then a solid zstd stream.
     writer.write_all(NCZ_MAGIC)?;
-    let data_to_compress = nca_size.saturating_sub(0x4000);
-    if data_to_compress > 0 {
-        writer.write_u64::<LittleEndian>(1)?; // section count
-        writer.write_u64::<LittleEndian>(0x4000)?; // section offset in NCA
-        writer.write_u64::<LittleEndian>(data_to_compress)?; // section size
-        writer.write_u64::<LittleEndian>(0)?; // crypto_type
-        writer.write_u64::<LittleEndian>(0)?; // padding
-        writer.write_all(&[0u8; 16])?; // crypto_key
-        writer.write_all(&[0u8; 16])?; // crypto_counter
-
-        let mut limited = reader.take(data_to_compress);
-        let mut enc = zstd::stream::write::Encoder::new(writer, compression_level).map_err(|e| {
-            NscbError::Crypto(format!("zstd encoder init error: {e}"))
-        })?;
-        let mut buf = vec![0u8; 1024 * 1024];
-        loop {
-            let n = limited.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            enc.write_all(&buf[..n])?;
-            if let Some(pb) = pb {
-                pb.inc(n as u64);
-            }
+    let mut out_sections: Vec<NczSection> = sections
+        .iter()
+        .filter(|s| s.has_valid_range())
+        .cloned()
+        .collect();
+    if out_sections.is_empty() {
+        let data_to_compress = nca_size.saturating_sub(0x4000);
+        if data_to_compress > 0 {
+            out_sections.push(NczSection {
+                offset: 0x4000,
+                size: data_to_compress,
+                crypto_type: 1,
+                _padding: 0,
+                crypto_key: [0u8; 16],
+                crypto_counter: [0u8; 16],
+            });
         }
-        enc.finish().map_err(|e| {
-            NscbError::Crypto(format!("zstd stream finalize error: {e}"))
-        })?;
     } else {
-        writer.write_u64::<LittleEndian>(0)?; // section count
+        out_sections.sort_by_key(|s| s.offset);
     }
 
+    writer.write_u64::<LittleEndian>(out_sections.len() as u64)?;
+    for s in &out_sections {
+        writer.write_u64::<LittleEndian>(s.offset)?;
+        writer.write_u64::<LittleEndian>(s.size)?;
+        writer.write_u64::<LittleEndian>(s.crypto_type)?;
+        writer.write_u64::<LittleEndian>(0)?;
+        writer.write_all(&s.crypto_key)?;
+        writer.write_all(&s.crypto_counter)?;
+    }
+
+    if nca_size > 0x4000 {
+        let mut enc = zstd::stream::write::Encoder::new(writer, compression_level)
+            .map_err(|e| NscbError::Crypto(format!("zstd encoder init error: {e}")))?;
+        let mut pos = 0x4000u64;
+        for s in &out_sections {
+            if s.offset > pos {
+                stream_range(reader, &mut enc, nca_base, pos, s.offset - pos, None, pb)?;
+            }
+            stream_range(reader, &mut enc, nca_base, s.offset, s.size, Some(s), pb)?;
+            pos = s.offset.saturating_add(s.size);
+        }
+        if pos < nca_size {
+            stream_range(reader, &mut enc, nca_base, pos, nca_size - pos, None, pb)?;
+        }
+        enc.finish()
+            .map_err(|e| NscbError::Crypto(format!("zstd stream finalize error: {e}")))?;
+    }
+
+    Ok(())
+}
+
+fn stream_range<R: Read + Seek, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    nca_base: u64,
+    rel_offset: u64,
+    size: u64,
+    section: Option<&NczSection>,
+    pb: Option<&ProgressBar>,
+) -> Result<()> {
+    if size == 0 {
+        return Ok(());
+    }
+    reader.seek(SeekFrom::Start(nca_base + rel_offset))?;
+    let mut remaining = size;
+    let mut abs = rel_offset;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buf.len() as u64) as usize;
+        reader.read_exact(&mut buf[..take])?;
+        if let Some(s) = section {
+            if s.crypto_type == 3 || s.crypto_type == 4 {
+                let cipher = Aes128::new_from_slice(&s.crypto_key)
+                    .map_err(|e| NscbError::Crypto(format!("AES key init: {e}")))?;
+                aes_ctr_transform_in_place(&cipher, &s.crypto_counter[..8], abs, &mut buf[..take]);
+            }
+        }
+        writer.write_all(&buf[..take])?;
+        if let Some(pb) = pb {
+            pb.inc(take as u64);
+        }
+        remaining -= take as u64;
+        abs += take as u64;
+    }
     Ok(())
 }
