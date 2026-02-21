@@ -12,6 +12,7 @@ KEYS="${KEYS:-$TEST_DIR/prod.keys}"
 BASE_FILE="${BASE_FILE:-$TEST_DIR/Hollow Knight-0100633007D48000--US--v0-.nsp}"
 UPD_FILE="${UPD_FILE:-$TEST_DIR/Hollow Knight v1.5.12459 [0100633007D48800][v458752][UPD].nsz}"
 SMALL_NSZ="${SMALL_NSZ:-$TEST_DIR/[UPD][v1.0.5][010057D006492800][18.0.0].nsz}"
+MERGE_EXTRA="${MERGE_EXTRA:-}"
 
 RUST_BIN=(cargo run --)
 FAIL=0
@@ -50,6 +51,19 @@ compare_hash_sets() {
   fi
 }
 
+compare_names() {
+  local left="$1"
+  local right="$2"
+  local label="$3"
+  local lb rb
+  lb="$(basename "$left")"
+  rb="$(basename "$right")"
+  echo "$label: left='$lb' right='$rb'"
+  if [[ "$lb" != "$rb" ]]; then
+    FAIL=1
+  fi
+}
+
 need_file "$KEYS"
 need_file "$BASE_FILE"
 need_file "$UPD_FILE"
@@ -66,15 +80,19 @@ fi
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"/{logs,py,rust,cmp}
 
-cat >"$OUT_DIR/merge_list.txt" <<EOF
-$BASE_FILE
-$UPD_FILE
-EOF
+MERGE_INPUTS=("$BASE_FILE" "$UPD_FILE")
+if [[ -n "$MERGE_EXTRA" ]]; then
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && MERGE_INPUTS+=("$line")
+  done <<<"$MERGE_EXTRA"
+fi
+
+printf "%s\n" "${MERGE_INPUTS[@]}" >"$OUT_DIR/merge_list.txt"
 
 log "Merge (Rust)"
 (
   cd "$ROOT_DIR"
-  "${RUST_BIN[@]}" --direct_multi "$BASE_FILE" "$UPD_FILE" \
+  "${RUST_BIN[@]}" --direct_multi "${MERGE_INPUTS[@]}" \
     --type nsp --ofolder "$OUT_DIR/rust" --keys "$KEYS" \
     >"$OUT_DIR/logs/rust_merge.log" 2>&1
 )
@@ -93,6 +111,7 @@ RUST_MERGED="$(find "$OUT_DIR/rust" -maxdepth 1 -type f -name '*.nsp' | head -n1
 PY_MERGED="$(find "$OUT_DIR/py" -maxdepth 1 -type f -name '*.nsp' | head -n1)"
 need_file "$RUST_MERGED"
 need_file "$PY_MERGED"
+compare_names "$RUST_MERGED" "$PY_MERGED" "merge_filename"
 
 log "Merge parity (payload compare via split/hash)"
 mkdir -p "$OUT_DIR/cmp/merge_split_rust" "$OUT_DIR/cmp/merge_split_py"
@@ -122,9 +141,19 @@ hash_nca_set "$OUT_DIR/cmp/split_py" "$OUT_DIR/cmp/split_py.sha"
 compare_hash_sets "$OUT_DIR/cmp/split_rust.sha" "$OUT_DIR/cmp/split_py.sha" "split_payload"
 
 log "Create parity (same input folder for both tools)"
-PY_BASE_DIR="$(find "$OUT_DIR/cmp/split_py" -maxdepth 1 -type d -name '*0100633007d48000*' | head -n1)"
+BASE_TID="$(basename "$BASE_FILE" | grep -oE '[0-9A-Fa-f]{16}' | head -n1 | tr '[:upper:]' '[:lower:]')"
+if [[ -z "$BASE_TID" ]]; then
+  echo "Could not infer base title id from BASE_FILE: $BASE_FILE" >&2
+  exit 1
+fi
+PY_BASE_DIR="$(find "$OUT_DIR/cmp/split_py" -maxdepth 1 -type d -name "*${BASE_TID}*" | head -n1)"
 if [[ -z "$PY_BASE_DIR" ]]; then
-  echo "Could not locate python base split folder under $OUT_DIR/cmp/split_py" >&2
+  # Squirrel's `-dmul -t nsp` with mixed XCI inputs can omit BASE payload from the output.
+  # Fall back to the first split folder for create parity in that case.
+  PY_BASE_DIR="$(find "$OUT_DIR/cmp/split_py" -mindepth 1 -maxdepth 1 -type d | sort | head -n1)"
+fi
+if [[ -z "$PY_BASE_DIR" ]]; then
+  echo "Could not locate any python split folder under $OUT_DIR/cmp/split_py" >&2
   exit 1
 fi
 (
@@ -153,7 +182,7 @@ log "Compress/decompress parity (small NSZ)"
   cd "$ROOT_DIR"
   "${RUST_BIN[@]}" --decompress "$SMALL_NSZ" --ofolder "$OUT_DIR/rust" --keys "$KEYS" >"$OUT_DIR/logs/rust_decompress.log" 2>&1
 )
-RUST_SMALL_NSP="$(find "$OUT_DIR/rust" -maxdepth 1 -type f -name '*.nsp' | rg '010057D006492800|\\[UPD\\]|v1.0.5' | head -n1)"
+RUST_SMALL_NSP="$(ls -t "$OUT_DIR"/rust/*.nsp 2>/dev/null | head -n1 || true)"
 need_file "$RUST_SMALL_NSP"
 
 (
@@ -173,6 +202,7 @@ RUST_SMALL_NSZ="$OUT_DIR/rust/$(basename "${RUST_SMALL_NSP%.nsp}.nsz")"
 PY_SMALL_NSZ="$OUT_DIR/py/$(basename "${RUST_SMALL_NSP%.nsp}.nsz")"
 need_file "$RUST_SMALL_NSZ"
 need_file "$PY_SMALL_NSZ"
+compare_names "$RUST_SMALL_NSZ" "$PY_SMALL_NSZ" "compress_filename"
 
 mkdir -p "$OUT_DIR/cmp/decomp_rust_nsz" "$OUT_DIR/cmp/decomp_py_nsz"
 (
@@ -200,11 +230,11 @@ stat -c '%n\t%s' "$RUST_MERGED" "$PY_MERGED" "$RUST_SMALL_NSZ" "$PY_SMALL_NSZ" "
 
 echo
 if [[ "$FAIL" -eq 0 ]]; then
-  echo "Parity suite PASSED (payload-level checks matched)."
+  echo "Parity suite PASSED (payload + filename checks matched)."
   echo "Artifacts and logs: $OUT_DIR"
   exit 0
 else
-  echo "Parity suite FAILED (at least one payload-level comparison differed)." >&2
+  echo "Parity suite FAILED (at least one payload or filename comparison differed)." >&2
   echo "Inspect logs/artifacts under: $OUT_DIR" >&2
   exit 1
 fi

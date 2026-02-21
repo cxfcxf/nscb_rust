@@ -1,7 +1,13 @@
 use clap::Parser;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 
 use crate::error::Result;
+use crate::formats::nsp::Nsp;
+use crate::formats::types::{ContentType, TitleType};
+use crate::formats::xci::Xci;
 use crate::keys::KeyStore;
 
 use regex::Regex;
@@ -71,13 +77,26 @@ pub fn dispatch(args: Args) -> Result<()> {
     // Dispatch to the correct operation
     if let Some(files) = &args.direct_multi {
         let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-        let merge_name = build_merge_filename(&file_refs, &args.output_type);
+        let merge_name = build_merge_filename_metadata(&file_refs, &args.output_type, &ks)
+            .unwrap_or_else(|| build_merge_filename(&file_refs, &args.output_type));
+        let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp")
+            && file_refs.iter().any(|p| {
+                let lower = p.to_ascii_lowercase();
+                lower.ends_with(".xci") || lower.ends_with(".xcz")
+            });
         let output = make_output_path(
             files.first().map(|s| s.as_str()).unwrap_or("merged"),
             &args.ofolder,
             &merge_name,
         );
-        return crate::ops::merge::merge(&file_refs, &output, &ks, args.nodelta, &args.output_type);
+        return crate::ops::merge::merge(
+            &file_refs,
+            &output,
+            &ks,
+            args.nodelta,
+            &args.output_type,
+            nsp_direct_multi_python_mode,
+        );
     }
 
     if let Some(path) = &args.splitter {
@@ -203,9 +222,19 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
             .map(|c| c[1].to_uppercase())
             .collect();
 
-        // Determine content type from filename tags or title ID pattern
-        let is_update = upd_re.is_match(&filename);
-        let is_dlc = dlc_re.is_match(&filename);
+        // Determine content type from filename tags or title ID pattern.
+        // Fallback to title-id suffix when explicit tags are missing:
+        // - ...800 => update
+        // - ...000 => base/game
+        // - otherwise => DLC
+        let has_update_tid = title_ids.iter().any(|tid| tid.ends_with("800"));
+        let has_base_tid = title_ids.iter().any(|tid| tid.ends_with("000"));
+        let has_dlc_tid = title_ids
+            .iter()
+            .any(|tid| !tid.ends_with("800") && !tid.ends_with("000"));
+
+        let is_update = upd_re.is_match(&filename) || has_update_tid;
+        let is_dlc = dlc_re.is_match(&filename) || (!is_update && has_dlc_tid && !has_base_tid);
         let is_base = !is_update && !is_dlc;
 
         // Title ID heuristic: base ends in 000, update ends in 800, DLC is between
@@ -273,4 +302,453 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
         "{} [{}] [v{}] ({}).{}",
         name, tid, ver, summary, output_type
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeKind {
+    Base,
+    Update,
+    Dlc,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MergeTitleRecord {
+    title_id: u64,
+    version: u32,
+    kind: MergeKind,
+}
+
+fn kind_from_title_type(title_type: Option<TitleType>, title_id: u64) -> MergeKind {
+    match title_type {
+        Some(TitleType::Application) => MergeKind::Base,
+        Some(TitleType::Patch) => MergeKind::Update,
+        Some(TitleType::AddOnContent) => MergeKind::Dlc,
+        _ => match title_id & 0xFFF {
+            0x000 => MergeKind::Base,
+            0x800 => MergeKind::Update,
+            _ => MergeKind::Dlc,
+        },
+    }
+}
+
+fn build_merge_filename_metadata(
+    input_paths: &[&str],
+    output_type: &str,
+    ks: &KeyStore,
+) -> Option<String> {
+    let (records, latest_version, title_name) = collect_title_records(input_paths, ks);
+    if records.is_empty() {
+        return None;
+    }
+
+    let mut base_count = 0u32;
+    let mut update_count = 0u32;
+    let mut dlc_count = 0u32;
+    let mut base_tid: Option<u64> = None;
+    let mut update_tid: Option<u64> = None;
+
+    for rec in records.values() {
+        match rec.kind {
+            MergeKind::Base => {
+                base_count += 1;
+                if base_tid.is_none() {
+                    base_tid = Some(rec.title_id);
+                }
+            }
+            MergeKind::Update => {
+                update_count += 1;
+                if update_tid.is_none() {
+                    update_tid = Some(rec.title_id);
+                }
+            }
+            MergeKind::Dlc => dlc_count += 1,
+        }
+    }
+
+    let title_id = base_tid.or_else(|| {
+        update_tid.map(|u| {
+            let mut s = format!("{:016X}", u);
+            let len = s.len();
+            s.replace_range(len - 3.., "000");
+            u64::from_str_radix(&s, 16).unwrap_or(u)
+        })
+    });
+    let tid = format!("{:016X}", title_id.unwrap_or(0));
+    let name = title_name
+        .filter(|s| !s.trim().is_empty() && s != "DLC")
+        .unwrap_or_else(|| infer_game_name_from_path(input_paths.first().copied().unwrap_or("merged")));
+    let ver = latest_version.unwrap_or(0);
+
+    let mut ccount = String::new();
+    if base_count > 0 {
+        ccount.push_str(&format!("{}G", base_count));
+    }
+    if update_count > 0 {
+        if !ccount.is_empty() {
+            ccount.push('+');
+        }
+        ccount.push_str(&format!("{}U", update_count));
+    }
+    if dlc_count > 0 {
+        if !ccount.is_empty() {
+            ccount.push('+');
+        }
+        ccount.push_str(&format!("{}D", dlc_count));
+    }
+    let ccount = if ccount == "1G" || ccount == "1U" || ccount == "1D" || ccount.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", ccount)
+    };
+
+    Some(format!(
+        "{} [{}] [v{}]{}.{}",
+        name, tid, ver, ccount, output_type
+    ))
+}
+
+fn collect_title_records(
+    input_paths: &[&str],
+    ks: &KeyStore,
+) -> (HashMap<u64, MergeTitleRecord>, Option<u32>, Option<String>) {
+    let mut temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
+    let mut effective_paths: Vec<String> = Vec::new();
+
+    for path_str in input_paths {
+        let ext = Path::new(path_str)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        match ext.as_str() {
+            "nsz" | "xcz" => {
+                if let Ok(tmp) = tempfile::NamedTempFile::new() {
+                    let tmp_path = tmp.path().to_string_lossy().to_string();
+                    if crate::ops::decompress::decompress(path_str, &tmp_path).is_ok() {
+                        effective_paths.push(tmp_path);
+                        temp_files.push(tmp);
+                    } else {
+                        effective_paths.push((*path_str).to_string());
+                    }
+                } else {
+                    effective_paths.push((*path_str).to_string());
+                }
+            }
+            _ => effective_paths.push((*path_str).to_string()),
+        }
+    }
+
+    let mut by_title: HashMap<u64, MergeTitleRecord> = HashMap::new();
+    let mut latest_version: Option<u32> = None;
+    let mut title_name: Option<String> = None;
+
+    for path_str in &effective_paths {
+        let ext = Path::new(path_str)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        match ext.as_str() {
+            "nsp" => {
+                let _ =
+                    collect_title_records_from_nsp(path_str, ks, &mut by_title, &mut latest_version, &mut title_name);
+            }
+            "xci" => {
+                let _ =
+                    collect_title_records_from_xci(path_str, ks, &mut by_title, &mut latest_version, &mut title_name);
+            }
+            _ => {
+                // Decompressed temp files may not have extension.
+                if collect_title_records_from_nsp(path_str, ks, &mut by_title, &mut latest_version, &mut title_name)
+                    .is_err()
+                {
+                    let _ = collect_title_records_from_xci(
+                        path_str,
+                        ks,
+                        &mut by_title,
+                        &mut latest_version,
+                        &mut title_name,
+                    );
+                }
+            }
+        }
+    }
+
+    if by_title.len() < input_paths.len() {
+        add_filename_fallback_records(input_paths, &mut by_title, &mut latest_version);
+    }
+
+    drop(temp_files);
+    (by_title, latest_version, title_name)
+}
+
+fn collect_title_records_from_nsp(
+    path: &str,
+    ks: &KeyStore,
+    out: &mut HashMap<u64, MergeTitleRecord>,
+    latest_version: &mut Option<u32>,
+    title_name: &mut Option<String>,
+) -> std::result::Result<(), ()> {
+    let mut file = BufReader::new(File::open(path).map_err(|_| ())?);
+    let nsp = Nsp::parse(&mut file).map_err(|_| ())?;
+
+    let mut found_any = false;
+    for meta in nsp.cnmt_nca_entries(&mut file, ks) {
+        if let Some(entry) = nsp.pfs0.find(&meta.filename) {
+            let abs_offset = nsp.file_abs_offset(entry);
+            if let Some(cnmt) = crate::ops::split::parse_cnmt_from_meta_nca(&mut file, abs_offset, ks) {
+                found_any = true;
+                upsert_record(
+                    out,
+                    MergeTitleRecord {
+                        title_id: cnmt.title_id,
+                        version: cnmt.version,
+                        kind: kind_from_title_type(cnmt.title_type_enum(), cnmt.title_id),
+                    },
+                );
+                if latest_version.is_none_or(|v| cnmt.version > v) {
+                    *latest_version = Some(cnmt.version);
+                }
+            }
+        }
+    }
+
+    // Title lookup path similar to squirrel.get_title(): read CONTROL NCA -> NACP title.
+    if title_name.is_none() {
+        for entry in nsp.nca_entries() {
+            if let Ok(info) =
+                crate::formats::nca::parse_nca_info(&mut file, nsp.file_abs_offset(entry), entry.size, &entry.name, ks)
+            {
+                if info.content_type == Some(ContentType::Control) {
+                    let abs_offset = nsp.file_abs_offset(entry);
+                    if let Some(name) =
+                        crate::ops::split::parse_nacp_title_from_control_nca(&mut file, abs_offset, ks)
+                    {
+                        *title_name = Some(name);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if found_any { Ok(()) } else { Err(()) }
+}
+
+fn collect_title_records_from_xci(
+    path: &str,
+    ks: &KeyStore,
+    out: &mut HashMap<u64, MergeTitleRecord>,
+    latest_version: &mut Option<u32>,
+    title_name: &mut Option<String>,
+) -> std::result::Result<(), ()> {
+    let mut file = BufReader::new(File::open(path).map_err(|_| ())?);
+    let xci = Xci::parse(&mut file).map_err(|_| ())?;
+    let secure_entries = xci.secure_nca_entries(&mut file).map_err(|_| ())?;
+
+    let mut found_any = false;
+    for entry in &secure_entries {
+        if let Ok(info) =
+            crate::formats::nca::parse_nca_info(&mut file, entry.abs_offset, entry.size, &entry.name, ks)
+        {
+            if info.content_type == Some(ContentType::Meta) {
+                if let Some(cnmt) =
+                    crate::ops::split::parse_cnmt_from_meta_nca(&mut file, entry.abs_offset, ks)
+                {
+                    found_any = true;
+                    upsert_record(
+                        out,
+                        MergeTitleRecord {
+                            title_id: cnmt.title_id,
+                            version: cnmt.version,
+                            kind: kind_from_title_type(cnmt.title_type_enum(), cnmt.title_id),
+                        },
+                    );
+                    if latest_version.is_none_or(|v| cnmt.version > v) {
+                        *latest_version = Some(cnmt.version);
+                    }
+                } else {
+                    found_any = true;
+                    upsert_record(
+                        out,
+                        MergeTitleRecord {
+                            title_id: info.title_id,
+                            version: 0,
+                            kind: kind_from_title_type(None, info.title_id),
+                        },
+                    );
+                }
+            } else if info.content_type == Some(ContentType::Control) && title_name.is_none() {
+                if let Some(name) =
+                    crate::ops::split::parse_nacp_title_from_control_nca(&mut file, entry.abs_offset, ks)
+                {
+                    *title_name = Some(name);
+                }
+            }
+        }
+    }
+
+    if found_any {
+        return Ok(());
+    }
+
+    // Last fallback for unusual XCI layouts where Meta content-type detection fails:
+    // parse explicit *.cnmt.nca entries by filename.
+    for entry in &secure_entries {
+        if entry.name.to_ascii_lowercase().ends_with(".cnmt.nca") {
+            if let Some(cnmt) =
+                crate::ops::split::parse_cnmt_from_meta_nca(&mut file, entry.abs_offset, ks)
+            {
+                found_any = true;
+                upsert_record(
+                    out,
+                    MergeTitleRecord {
+                        title_id: cnmt.title_id,
+                        version: cnmt.version,
+                        kind: kind_from_title_type(cnmt.title_type_enum(), cnmt.title_id),
+                    },
+                );
+                if latest_version.is_none_or(|v| cnmt.version > v) {
+                    *latest_version = Some(cnmt.version);
+                }
+            }
+        }
+    }
+
+    if found_any { Ok(()) } else { Err(()) }
+}
+
+fn upsert_record(map: &mut HashMap<u64, MergeTitleRecord>, rec: MergeTitleRecord) {
+    match map.get(&rec.title_id) {
+        Some(cur) if cur.version >= rec.version => {}
+        _ => {
+            map.insert(rec.title_id, rec);
+        }
+    }
+}
+
+fn add_filename_fallback_records(
+    input_paths: &[&str],
+    out: &mut HashMap<u64, MergeTitleRecord>,
+    latest_version: &mut Option<u32>,
+) {
+    let tid_re = Regex::new(r"[\[-]([0-9A-Fa-f]{16})[\]-]").unwrap();
+    let ver_bracket_re = Regex::new(r"\[v(\d+)\]").unwrap();
+    let ver_dash_re = Regex::new(r"--v(\d+)-").unwrap();
+    let num_bracket_re = Regex::new(r"\[(\d+)\]").unwrap();
+    let upd_re = Regex::new(r"(?i)\[UPD\]").unwrap();
+    let dlc_re = Regex::new(r"(?i)\[DLC\]").unwrap();
+
+    for path_str in input_paths {
+        let filename = Path::new(path_str)
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let tid = tid_re
+            .captures_iter(&filename)
+            .next()
+            .and_then(|c| u64::from_str_radix(&c[1], 16).ok());
+        let Some(title_id) = tid else {
+            continue;
+        };
+
+        let has_update_tid = (title_id & 0xFFF) == 0x800;
+        let has_base_tid = (title_id & 0xFFF) == 0x000;
+        let kind = if upd_re.is_match(&filename) || has_update_tid {
+            MergeKind::Update
+        } else if dlc_re.is_match(&filename) || !has_base_tid {
+            MergeKind::Dlc
+        } else {
+            MergeKind::Base
+        };
+
+        let mut version = ver_bracket_re
+            .captures(&filename)
+            .or_else(|| ver_dash_re.captures(&filename))
+            .and_then(|c| c.get(1))
+            .and_then(|m| m.as_str().parse::<u32>().ok())
+            .unwrap_or(0);
+        if version == 0 {
+            for cap in num_bracket_re.captures_iter(&filename) {
+                if let Ok(v) = cap[1].parse::<u32>() {
+                    if v > version {
+                        version = v;
+                    }
+                }
+            }
+        }
+
+        upsert_record(
+            out,
+            MergeTitleRecord {
+                title_id,
+                version,
+                kind,
+            },
+        );
+        if latest_version.is_none_or(|v| version > v) {
+            *latest_version = Some(version);
+        }
+    }
+}
+
+fn infer_game_name_from_path(path_str: &str) -> String {
+    let filename = Path::new(path_str)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    if let Some(bracket_pos) = filename.find('[') {
+        let n = filename[..bracket_pos].trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    if let Some(dash_pos) = filename.find('-') {
+        let n = filename[..dash_pos].trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    let n = filename.trim();
+    if n.is_empty() {
+        "merged".to_string()
+    } else {
+        n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_merge_filename;
+
+    #[test]
+    fn merge_filename_counts_dlc_without_dlc_tag() {
+        let mut inputs = vec![
+            "SUPER ROBOT WARS Y [010063301BD50000][v0].nsp".to_string(),
+            "SUPER ROBOT WARS Y [010063301BD50800][v524288].nsp".to_string(),
+        ];
+        for i in 1..=7 {
+            inputs.push(format!(
+                "SUPER ROBOT WARS Y Pack {} [010063301BD5{:04X}][v0].nsp",
+                i, i
+            ));
+        }
+        let input_refs: Vec<&str> = inputs.iter().map(|s| s.as_str()).collect();
+        let out = build_merge_filename(&input_refs, "xci");
+        assert!(out.contains("(1G+1U+7D).xci"), "actual output: {}", out);
+    }
+
+    #[test]
+    fn merge_filename_counts_update_without_upd_tag() {
+        let inputs = vec![
+            "Game [0100123412345000][v0].nsp",
+            "Game [0100123412345800][v65536].nsp",
+        ];
+        let out = build_merge_filename(&inputs, "nsp");
+        assert!(out.contains("(1G+1U).nsp"), "actual output: {}", out);
+    }
 }

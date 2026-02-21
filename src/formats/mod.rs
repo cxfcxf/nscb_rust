@@ -1,5 +1,6 @@
 pub mod cnmt;
 pub mod hfs0;
+pub mod nacp;
 pub mod nca;
 pub mod ncz;
 pub mod nsp;

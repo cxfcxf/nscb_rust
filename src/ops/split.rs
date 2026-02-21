@@ -43,7 +43,8 @@ fn split_nsp(input_path: &str, output_dir: &str, ks: &KeyStore) -> Result<()> {
     let mut file = BufReader::new(File::open(input_path)?);
     let nsp = Nsp::parse(&mut file)?;
     let known_title_ids = collect_title_ids_from_ticket_names(&nsp);
-    let base_name = infer_game_name_from_input(input_path);
+    let base_name = infer_game_name_from_nsp(&nsp, &mut file, ks)
+        .unwrap_or_else(|| infer_game_name_from_input(input_path));
     let guessed_version = infer_version_from_input(input_path);
 
     // Get CNMT info to find which NCAs belong to which titles precisely.
@@ -251,6 +252,20 @@ fn infer_game_name_from_input(input_path: &str) -> String {
     }
 }
 
+fn infer_game_name_from_nsp<R: Read + Seek>(nsp: &Nsp, reader: &mut R, ks: &KeyStore) -> Option<String> {
+    for entry in nsp.nca_entries() {
+        let abs_offset = nsp.file_abs_offset(entry);
+        if let Ok(info) = nca::parse_nca_info(reader, abs_offset, entry.size, &entry.name, ks) {
+            if info.content_type == Some(crate::formats::types::ContentType::Control) {
+                if let Some(name) = parse_nacp_title_from_control_nca(reader, abs_offset, ks) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn infer_version_from_input(input_path: &str) -> Option<u32> {
     let stem = Path::new(input_path)
         .file_stem()
@@ -271,7 +286,8 @@ fn split_xci(input_path: &str, output_dir: &str, ks: &KeyStore) -> Result<()> {
     let mut file = BufReader::new(File::open(input_path)?);
     let xci = Xci::parse(&mut file)?;
     let secure_entries = xci.secure_nca_entries(&mut file)?;
-    let base_name = infer_game_name_from_input(input_path);
+    let base_name = infer_game_name_from_xci(&secure_entries, &mut file, ks)
+        .unwrap_or_else(|| infer_game_name_from_input(input_path));
     let guessed_version = infer_version_from_input(input_path);
 
     // Build CNMT mapping: content NCA id -> title id.
@@ -425,7 +441,24 @@ fn split_xci(input_path: &str, output_dir: &str, ks: &KeyStore) -> Result<()> {
     Ok(())
 }
 
-fn parse_cnmt_from_meta_nca<R: Read + Seek>(
+fn infer_game_name_from_xci<R: Read + Seek>(
+    secure_entries: &[crate::formats::xci::SecureNcaEntry],
+    reader: &mut R,
+    ks: &KeyStore,
+) -> Option<String> {
+    for entry in secure_entries {
+        if let Ok(info) = nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks) {
+            if info.content_type == Some(crate::formats::types::ContentType::Control) {
+                if let Some(name) = parse_nacp_title_from_control_nca(reader, entry.abs_offset, ks) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_cnmt_from_meta_nca<R: Read + Seek>(
     reader: &mut R,
     nca_abs_offset: u64,
     ks: &KeyStore,
@@ -522,6 +555,80 @@ fn parse_cnmt_from_meta_nca<R: Read + Seek>(
     None
 }
 
+pub(crate) fn parse_nacp_title_from_control_nca<R: Read + Seek>(
+    reader: &mut R,
+    nca_abs_offset: u64,
+    ks: &KeyStore,
+) -> Option<String> {
+    let header = crate::formats::nca::NcaHeader::from_reader(reader, nca_abs_offset, ks).ok()?;
+    let section_keys = header.decrypt_key_area(ks).ok();
+
+    for sec_idx in 0..4 {
+        let sec = &header.section_table[sec_idx];
+        if !sec.is_present() || sec.size() == 0 {
+            continue;
+        }
+        if sec.size() > 64 * 1024 * 1024 {
+            continue;
+        }
+
+        let sec_abs_offset = nca_abs_offset + sec.start_offset();
+        let mut section_data = vec![0u8; sec.size() as usize];
+        if reader.seek(SeekFrom::Start(sec_abs_offset)).is_err() {
+            continue;
+        }
+        if reader.read_exact(&mut section_data).is_err() {
+            continue;
+        }
+
+        if let Some(title) = parse_nacp_title_from_section_bytes(&section_data) {
+            return Some(title);
+        }
+
+        if let Some(keys) = &section_keys {
+            let nonce = header.section_ctr_nonce(sec_idx);
+            for key in keys {
+                for &start in &[sec.start_offset(), 0u64] {
+                    let mut dec_be = section_data.clone();
+                    aes_ctr_transform_in_place(key, &nonce, start, true, &mut dec_be);
+                    if let Some(title) = parse_nacp_title_from_section_bytes(&dec_be) {
+                        return Some(title);
+                    }
+
+                    let mut dec_le = section_data.clone();
+                    aes_ctr_transform_in_place(key, &nonce, start, false, &mut dec_le);
+                    if let Some(title) = parse_nacp_title_from_section_bytes(&dec_le) {
+                        return Some(title);
+                    }
+                }
+            }
+
+            if header.section_crypto_type(sec_idx) == 2 {
+                let pairs = [(0usize, 1usize), (1, 0), (2, 3), (3, 2), (0, 2), (2, 0)];
+                for (a, b) in pairs {
+                    let mut xts_key = [0u8; 32];
+                    xts_key[..16].copy_from_slice(&keys[a]);
+                    xts_key[16..].copy_from_slice(&keys[b]);
+                    let Ok(xts) = NintendoXts::new(&xts_key) else {
+                        continue;
+                    };
+                    for &start_sector in &[(sec.start_offset() / 0x200), 0u64] {
+                        for &le_sector in &[true, false] {
+                            let mut dec = section_data.clone();
+                            xts.decrypt_with_endian(start_sector, &mut dec, le_sector);
+                            if let Some(title) = parse_nacp_title_from_section_bytes(&dec) {
+                                return Some(title);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn parse_cnmt_from_section_bytes(section_data: &[u8]) -> Option<Cnmt> {
     for off in pfs0_candidate_offsets(section_data) {
         let mut cursor = Cursor::new(section_data);
@@ -542,6 +649,24 @@ fn parse_cnmt_from_section_bytes(section_data: &[u8]) -> Option<Cnmt> {
         }
     }
     None
+}
+
+fn parse_nacp_title_from_section_bytes(section_data: &[u8]) -> Option<String> {
+    for off in pfs0_candidate_offsets(section_data) {
+        let mut cursor = Cursor::new(section_data);
+        let Ok(pfs) = Pfs0::parse_at(&mut cursor, off as u64) else {
+            continue;
+        };
+        for entry in &pfs.entries {
+            if entry.name.ends_with(".nacp") {
+                let bytes = pfs.read_file(&mut cursor, &entry.name).ok()?;
+                if let Ok(title) = crate::formats::nacp::parse_title(&bytes) {
+                    return Some(title);
+                }
+            }
+        }
+    }
+    crate::formats::nacp::parse_title_heuristic_scan(section_data)
 }
 
 fn parse_cnmt_from_section_bytes_allow_empty(section_data: &[u8]) -> Option<Cnmt> {

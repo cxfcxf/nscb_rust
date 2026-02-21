@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use aes::cipher::{BlockEncrypt, KeyInit};
@@ -64,8 +64,12 @@ pub fn create_from_folder(input_dir: &str, output_path: &str, ks: &KeyStore) -> 
 
     for p in &ordered {
         let size = p.metadata()?.len();
-        let mut src = File::open(p)?;
-        uio::copy_with_progress(&mut src, &mut out, size, Some(&pb))?;
+        if lower_name(p).ends_with(".nca") && size >= 0xC00 {
+            copy_nca_with_eshop_flag(p, size, &mut out, &pb, ks)?;
+        } else {
+            let mut src = File::open(p)?;
+            uio::copy_with_progress(&mut src, &mut out, size, Some(&pb))?;
+        }
     }
 
     out.flush()?;
@@ -257,6 +261,29 @@ fn parse_cnmt_from_meta_nca_file(path: &Path, ks: &KeyStore) -> Option<Cnmt> {
         }
     }
     None
+}
+
+fn copy_nca_with_eshop_flag(
+    path: &Path,
+    size: u64,
+    out: &mut BufWriter<File>,
+    pb: &indicatif::ProgressBar,
+    ks: &KeyStore,
+) -> Result<()> {
+    let mut src = File::open(path)?;
+
+    let mut enc_header = vec![0u8; 0xC00];
+    src.read_exact(&mut enc_header)?;
+    let patched = crate::formats::nca::rewrite_header_for_nsp(&enc_header, ks).unwrap_or(enc_header);
+    out.write_all(&patched)?;
+    pb.inc(patched.len() as u64);
+
+    if size > 0xC00 {
+        src.seek(SeekFrom::Start(0xC00))?;
+        uio::copy_with_progress(&mut src, out, size - 0xC00, Some(pb))?;
+    }
+
+    Ok(())
 }
 
 fn parse_cnmt_from_section_bytes(section: &[u8]) -> Option<Cnmt> {

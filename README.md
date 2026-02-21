@@ -154,3 +154,47 @@ target/release/nscb \
 - Split uses title-aware grouping and writes separate base/update/DLC folders.
 - For large files, always use an output folder (`-o`) to avoid overwriting source content.
 - If `--keys` is not set, the app also checks common default key locations.
+
+## Parity Testing
+
+Use the included parity runner to compare Rust outputs against NSC_BUILDER Python behavior:
+
+```bash
+./run_parity_exact.sh
+```
+
+Common env vars:
+
+- `TEST_DIR`: folder containing test inputs and `prod.keys`
+- `BASE_FILE`: base input file
+- `UPD_FILE`: update input file
+- `MERGE_EXTRA`: newline-separated extra merge inputs (typically DLC files)
+- `SMALL_NSZ`: small NSZ file for compress/decompress checks
+- `OUT_DIR`: output artifacts/logs folder
+- `PY_REPO`: local NSC_BUILDER clone path
+
+For exact mixed-input merge parity (`direct_multi -t nsp` quirks), set:
+
+```bash
+NSCB_PY_ZTOOLS=/tmp/NSC_BUILDER_cfx/py/ztools
+NSCB_PYTHON=/tmp/NSC_BUILDER_cfx/.venv/bin/python
+```
+
+Example (`E:\dumps\game_set` on WSL as `/mnt/e/dumps/game_set`):
+
+```bash
+BASE_FILE="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[APP\]' | head -n1)"
+UPD_FILE="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[UPD\]' | head -n1)"
+SMALL_NSZ="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[DLC' | head -n1)"
+MERGE_EXTRA="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[DLC' | sort)"
+TEST_DIR=/mnt/e/dumps/game_set \
+OUT_DIR=/tmp/parity_example \
+PY_REPO=/tmp/NSC_BUILDER_cfx \
+NSCB_PY_ZTOOLS=/tmp/NSC_BUILDER_cfx/py/ztools \
+NSCB_PYTHON=/tmp/NSC_BUILDER_cfx/.venv/bin/python \
+BASE_FILE="$BASE_FILE" \
+UPD_FILE="$UPD_FILE" \
+SMALL_NSZ="$SMALL_NSZ" \
+MERGE_EXTRA="$MERGE_EXTRA" \
+./run_parity_exact.sh
+```

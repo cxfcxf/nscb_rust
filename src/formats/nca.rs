@@ -367,6 +367,18 @@ pub fn rewrite_header_for_xci(
     Ok(dec)
 }
 
+/// Rewrite encrypted NCA header to force eShop distribution flag.
+///
+/// Mirrors NSC_BUILDER create path behavior where `setgamecard(0)` is applied
+/// before packing NSPs.
+pub fn rewrite_header_for_nsp(encrypted_header: &[u8], ks: &KeyStore) -> Result<Vec<u8>> {
+    let (mut dec, key, le_sector) = decrypt_header_for_edit(encrypted_header, ks)?;
+    dec[0x204] = 0x00;
+    let xts = NintendoXts::new(&key)?;
+    xts.encrypt_with_endian(0, &mut dec, le_sector);
+    Ok(dec)
+}
+
 /// Summary info for an NCA file (parsed from header).
 #[derive(Debug, Clone)]
 pub struct NcaInfo {

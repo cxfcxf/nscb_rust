@@ -1,12 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::process::Command;
+
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::Aes128;
 
 use crate::error::{NscbError, Result};
+use crate::formats::cnmt::Cnmt;
 use crate::formats::nca;
 use crate::formats::nca::NcaHeader;
 use crate::formats::nsp::Nsp;
+use crate::formats::pfs0::Pfs0;
 use crate::formats::pfs0::Pfs0Builder;
 use crate::formats::ticket::Ticket;
 use crate::formats::types::ContentType;
@@ -31,6 +37,8 @@ struct MergeEntry {
     content_type: Option<ContentType>,
     /// Is delta fragment.
     is_delta: bool,
+    /// Source came from NSP/NSZ-like container.
+    source_is_nsp_like: bool,
 }
 
 /// A ticket to include in the output.
@@ -51,6 +59,17 @@ struct CertEntry {
     size: u64,
 }
 
+/// A CNMT XML entry to include in NSP header (and optionally data stream).
+#[derive(Debug, Clone)]
+struct XmlEntry {
+    source_path: Option<String>,
+    name: String,
+    abs_offset: Option<u64>,
+    size: u64,
+    inline_data: Option<Vec<u8>>,
+    source_is_nsp_like: bool,
+}
+
 /// Merge multiple NSP/XCI files into one NSP.
 pub fn merge(
     input_paths: &[&str],
@@ -58,13 +77,16 @@ pub fn merge(
     ks: &KeyStore,
     exclude_deltas: bool,
     output_type: &str,
+    nsp_direct_multi_python_mode: bool,
 ) -> Result<()> {
     println!("Collecting NCA files from {} inputs...", input_paths.len());
 
     let mut all_ncas: Vec<MergeEntry> = Vec::new();
     let mut all_tickets: Vec<TicketEntry> = Vec::new();
     let mut all_certs: Vec<CertEntry> = Vec::new();
+    let mut all_xmls: Vec<XmlEntry> = Vec::new();
     let mut seen_nca_ids: HashMap<String, usize> = HashMap::new();
+    let mut seen_xml_names: HashSet<String> = HashSet::new();
 
     // Auto-decompress NSZ/XCZ inputs to temp files first
     let mut temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
@@ -113,7 +135,9 @@ pub fn merge(
                     &mut all_ncas,
                     &mut all_tickets,
                     &mut all_certs,
+                    &mut all_xmls,
                     &mut seen_nca_ids,
+                    &mut seen_xml_names,
                 )?;
             }
             "xci" => {
@@ -122,7 +146,9 @@ pub fn merge(
                     ks,
                     &mut all_ncas,
                     &mut all_tickets,
+                    &mut all_xmls,
                     &mut seen_nca_ids,
+                    &mut seen_xml_names,
                 )?;
             }
             _ => {
@@ -134,7 +160,9 @@ pub fn merge(
                     &mut all_ncas,
                     &mut all_tickets,
                     &mut all_certs,
+                    &mut all_xmls,
                     &mut seen_nca_ids,
+                    &mut seen_xml_names,
                 ) {
                     Ok(()) => {}
                     Err(_) => {
@@ -167,7 +195,14 @@ pub fn merge(
 
     match output_type {
         "xci" => build_xci_output(output_path, &all_ncas, &all_tickets, ks)?,
-        _ => build_nsp_output(output_path, &all_ncas, &all_tickets, &all_certs)?,
+        _ => build_nsp_output(
+            output_path,
+            &all_ncas,
+            &all_tickets,
+            &all_certs,
+            &all_xmls,
+            nsp_direct_multi_python_mode,
+        )?,
     }
 
     println!("Output written to {}", output_path);
@@ -180,42 +215,92 @@ fn collect_from_nsp(
     ncas: &mut Vec<MergeEntry>,
     tickets: &mut Vec<TicketEntry>,
     certs: &mut Vec<CertEntry>,
+    xmls: &mut Vec<XmlEntry>,
     seen: &mut HashMap<String, usize>,
+    seen_xml: &mut HashSet<String>,
 ) -> Result<()> {
     let mut file = BufReader::new(File::open(path)?);
     let nsp = Nsp::parse(&mut file)?;
 
-    // Collect NCA files
+    let mut id_to_entry: HashMap<String, (u64, u64, String)> = HashMap::new();
     for entry in nsp.nca_entries() {
-        let nca_id = entry
-            .name
-            .trim_end_matches(".nca")
-            .trim_end_matches(".ncz")
-            .to_lowercase();
+        let nca_id = entry.name.trim_end_matches(".nca").to_ascii_lowercase();
+        id_to_entry.insert(
+            nca_id,
+            (nsp.file_abs_offset(entry), entry.size, entry.name.clone()),
+        );
+    }
 
-        if seen.contains_key(&nca_id) {
-            continue; // Dedup
+    // Python-style order: CNMT content entries first, then meta NCA.
+    for meta in nsp.nca_entries().into_iter().filter(|e| e.name.ends_with(".cnmt.nca")) {
+        let meta_abs = nsp.file_abs_offset(meta);
+        maybe_add_generated_xml(
+            &mut file,
+            path,
+            meta.name.clone(),
+            meta_abs,
+            meta.size,
+            ks,
+            true,
+            xmls,
+            seen_xml,
+        )?;
+        if let Some(cnmt) = parse_cnmt_from_meta_nca_at(&mut file, meta_abs, ks) {
+            for c in &cnmt.content_entries {
+                let id = c.nca_id();
+                if let Some((abs_offset, size, name)) = id_to_entry.get(&id) {
+                    push_nca_if_new(
+                        ncas,
+                        seen,
+                        path,
+                        name.clone(),
+                        *abs_offset,
+                        *size,
+                        &mut file,
+                        ks,
+                        true,
+                    );
+                }
+            }
+            push_nca_if_new(
+                ncas,
+                seen,
+                path,
+                meta.name.clone(),
+                meta_abs,
+                meta.size,
+                &mut file,
+                ks,
+                true,
+            );
+        } else {
+            push_nca_if_new(
+                ncas,
+                seen,
+                path,
+                meta.name.clone(),
+                meta_abs,
+                meta.size,
+                &mut file,
+                ks,
+                true,
+            );
         }
-        seen.insert(nca_id, ncas.len());
+    }
 
-        let abs_offset = nsp.file_abs_offset(entry);
-
-        // Try to parse NCA header to get metadata
-        let (title_id, content_type) =
-            match nca::parse_nca_info(&mut file, abs_offset, entry.size, &entry.name, ks) {
-                Ok(info) => (info.title_id, info.content_type),
-                Err(_) => (0, None),
-            };
-
-        ncas.push(MergeEntry {
-            source_path: path.to_string(),
-            nca_name: entry.name.clone(),
-            abs_offset,
-            size: entry.size,
-            title_id,
-            content_type,
-            is_delta: false,
-        });
+    // Fallback: any remaining NCAs.
+    for entry in nsp.nca_entries() {
+        push_nca_if_new(
+            ncas,
+            seen,
+            path,
+            entry.name.clone(),
+            nsp.file_abs_offset(entry),
+            entry.size,
+            &mut file,
+            ks,
+            true,
+        );
     }
 
     // Collect tickets
@@ -246,7 +331,9 @@ fn collect_from_xci(
     ks: &KeyStore,
     ncas: &mut Vec<MergeEntry>,
     _tickets: &mut Vec<TicketEntry>,
+    xmls: &mut Vec<XmlEntry>,
     seen: &mut HashMap<String, usize>,
+    seen_xml: &mut HashSet<String>,
 ) -> Result<()> {
     let mut file = BufReader::new(File::open(path)?);
     let xci = Xci::parse(&mut file)?;
@@ -279,7 +366,22 @@ fn collect_from_xci(
             title_id,
             content_type,
             is_delta: false,
+            source_is_nsp_like: false,
         });
+
+        if entry.name.ends_with(".cnmt.nca") {
+            maybe_add_generated_xml(
+                &mut file,
+                path,
+                entry.name.clone(),
+                entry.abs_offset,
+                entry.size,
+                ks,
+                false,
+                xmls,
+                seen_xml,
+            )?;
+        }
     }
 
     Ok(())
@@ -290,22 +392,82 @@ fn build_nsp_output(
     ncas: &[MergeEntry],
     tickets: &[TicketEntry],
     certs: &[CertEntry],
+    xmls: &[XmlEntry],
+    python_direct_multi_mode: bool,
 ) -> Result<()> {
+    let mut nsp_backing_by_name: HashMap<String, &MergeEntry> = HashMap::new();
+    if python_direct_multi_mode {
+        for nca in ncas {
+            if nca.source_is_nsp_like {
+                nsp_backing_by_name
+                    .entry(nca.nca_name.to_ascii_lowercase())
+                    .or_insert(nca);
+            }
+        }
+    }
+
+    enum Item<'a> {
+        Nca(&'a MergeEntry),
+        Ticket(&'a TicketEntry),
+        Cert(&'a CertEntry),
+        Xml(&'a XmlEntry),
+    }
+    let mut items: Vec<Item<'_>> = Vec::new();
+    if python_direct_multi_mode {
+        let mut xml_by_name: HashMap<String, &XmlEntry> = HashMap::new();
+        for xml in xmls {
+            xml_by_name.insert(xml.name.to_ascii_lowercase(), xml);
+        }
+        let mut inserted_tik_cert = false;
+        for nca in ncas {
+            items.push(Item::Nca(nca));
+            if nca.nca_name.ends_with(".cnmt.nca") {
+                let xml_name = format!("{}.xml", nca.nca_name.trim_end_matches(".nca")).to_ascii_lowercase();
+                if let Some(xml) = xml_by_name.get(&xml_name) {
+                    items.push(Item::Xml(xml));
+                }
+                if (nca.title_id & 0xFFF) == 0x800 && !inserted_tik_cert {
+                    for tik in tickets {
+                        items.push(Item::Ticket(tik));
+                    }
+                    for cert in certs {
+                        items.push(Item::Cert(cert));
+                    }
+                    inserted_tik_cert = true;
+                }
+            }
+        }
+        if !inserted_tik_cert {
+            for tik in tickets {
+                items.push(Item::Ticket(tik));
+            }
+            for cert in certs {
+                items.push(Item::Cert(cert));
+            }
+        }
+    } else {
+        for nca in ncas {
+            items.push(Item::Nca(nca));
+        }
+        for tik in tickets {
+            items.push(Item::Ticket(tik));
+        }
+        for cert in certs {
+            items.push(Item::Cert(cert));
+        }
+        for xml in xmls {
+            items.push(Item::Xml(xml));
+        }
+    }
+
     let mut builder = Pfs0Builder::new();
-
-    // Add NCAs
-    for nca in ncas {
-        builder.add_file(nca.nca_name.clone(), nca.size);
-    }
-
-    // Add tickets
-    for tik in tickets {
-        builder.add_file(tik.name.clone(), tik.size);
-    }
-
-    // Add certs
-    for cert in certs {
-        builder.add_file(cert.name.clone(), cert.size);
+    for item in &items {
+        match item {
+            Item::Nca(n) => builder.add_file(n.nca_name.clone(), n.size),
+            Item::Ticket(t) => builder.add_file(t.name.clone(), t.size),
+            Item::Cert(c) => builder.add_file(c.name.clone(), c.size),
+            Item::Xml(x) => builder.add_file(x.name.clone(), x.size),
+        }
     }
 
     let header = builder.build_header();
@@ -318,27 +480,527 @@ fn build_nsp_output(
     out.write_all(&header)?;
     pb.set_position(header.len() as u64);
 
-    // Write NCA data
-    for nca in ncas {
-        let mut src = BufReader::new(File::open(&nca.source_path)?);
-        uio::copy_section(&mut src, &mut out, nca.abs_offset, nca.size, Some(&pb))?;
-    }
-
-    // Write ticket data
-    for tik in tickets {
-        let mut src = BufReader::new(File::open(&tik.source_path)?);
-        uio::copy_section(&mut src, &mut out, tik.abs_offset, tik.size, Some(&pb))?;
-    }
-
-    // Write cert data
-    for cert in certs {
-        let mut src = BufReader::new(File::open(&cert.source_path)?);
-        uio::copy_section(&mut src, &mut out, cert.abs_offset, cert.size, Some(&pb))?;
+    for item in &items {
+        match item {
+            Item::Nca(nca) => {
+                let to_write = if python_direct_multi_mode {
+                    nsp_backing_by_name
+                        .get(&nca.nca_name.to_ascii_lowercase())
+                        .copied()
+                } else {
+                    Some(*nca)
+                };
+                if let Some(entry) = to_write {
+                    let mut src = BufReader::new(File::open(&entry.source_path)?);
+                    uio::copy_section(&mut src, &mut out, entry.abs_offset, entry.size, Some(&pb))?;
+                }
+            }
+            Item::Ticket(tik) => {
+                let mut src = BufReader::new(File::open(&tik.source_path)?);
+                uio::copy_section(&mut src, &mut out, tik.abs_offset, tik.size, Some(&pb))?;
+            }
+            Item::Cert(cert) => {
+                let mut src = BufReader::new(File::open(&cert.source_path)?);
+                uio::copy_section(&mut src, &mut out, cert.abs_offset, cert.size, Some(&pb))?;
+            }
+            Item::Xml(xml) => {
+                if python_direct_multi_mode && !xml.source_is_nsp_like {
+                    continue;
+                }
+                if let Some(bytes) = &xml.inline_data {
+                    out.write_all(bytes)?;
+                    pb.inc(bytes.len() as u64);
+                } else if let (Some(source_path), Some(abs_offset)) = (&xml.source_path, xml.abs_offset) {
+                    let mut src = BufReader::new(File::open(source_path)?);
+                    uio::copy_section(&mut src, &mut out, abs_offset, xml.size, Some(&pb))?;
+                }
+            }
+        }
     }
 
     out.flush()?;
     pb.finish_with_message("Done");
     Ok(())
+}
+
+fn push_nca_if_new(
+    ncas: &mut Vec<MergeEntry>,
+    seen: &mut HashMap<String, usize>,
+    source_path: &str,
+    name: String,
+    abs_offset: u64,
+    size: u64,
+    file: &mut BufReader<File>,
+    ks: &KeyStore,
+    source_is_nsp_like: bool,
+) {
+    let nca_id = name
+        .trim_end_matches(".nca")
+        .trim_end_matches(".ncz")
+        .to_ascii_lowercase();
+    if seen.contains_key(&nca_id) {
+        return;
+    }
+    seen.insert(nca_id, ncas.len());
+    let (title_id, content_type) = match nca::parse_nca_info(file, abs_offset, size, &name, ks) {
+        Ok(info) => (info.title_id, info.content_type),
+        Err(_) => (0, None),
+    };
+    ncas.push(MergeEntry {
+        source_path: source_path.to_string(),
+        nca_name: name,
+        abs_offset,
+        size,
+        title_id,
+        content_type,
+        is_delta: false,
+        source_is_nsp_like,
+    });
+}
+
+fn maybe_add_generated_xml(
+    file: &mut BufReader<File>,
+    source_path: &str,
+    meta_name: String,
+    abs_offset: u64,
+    size: u64,
+    ks: &KeyStore,
+    source_is_nsp_like: bool,
+    xmls: &mut Vec<XmlEntry>,
+    seen_xml: &mut HashSet<String>,
+) -> Result<()> {
+    if !meta_name.ends_with(".cnmt.nca") {
+        return Ok(());
+    }
+    if let Some(py_xml) = generate_xml_via_python_container(source_path, &meta_name)? {
+        let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
+        if seen_xml.insert(xml_name.to_ascii_lowercase()) {
+            xmls.push(XmlEntry {
+                source_path: if source_is_nsp_like {
+                    Some(source_path.to_string())
+                } else {
+                    None
+                },
+                name: xml_name,
+                abs_offset: None,
+                size: py_xml.len() as u64,
+                inline_data: Some(py_xml),
+                source_is_nsp_like,
+            });
+        }
+        return Ok(());
+    }
+    if let Some(py_xml) = generate_xml_via_python(file, abs_offset, size, &meta_name)? {
+        let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
+        if seen_xml.insert(xml_name.to_ascii_lowercase()) {
+            xmls.push(XmlEntry {
+                source_path: if source_is_nsp_like {
+                    Some(source_path.to_string())
+                } else {
+                    None
+                },
+                name: xml_name,
+                abs_offset: None,
+                size: py_xml.len() as u64,
+                inline_data: Some(py_xml),
+                source_is_nsp_like,
+            });
+        }
+        return Ok(());
+    }
+    let Some((cnmt, digest, crypto2, keygen, nsha)) = parse_meta_xml_info(file, abs_offset, size, ks)? else {
+        return Ok(());
+    };
+    let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
+    if !seen_xml.insert(xml_name.to_ascii_lowercase()) {
+        return Ok(());
+    }
+    let xml = build_python_cnmt_xml(&meta_name, size, &cnmt, &digest, crypto2, keygen, &nsha);
+    xmls.push(XmlEntry {
+        source_path: if source_is_nsp_like {
+            Some(source_path.to_string())
+        } else {
+            None
+        },
+        name: xml_name,
+        abs_offset: None,
+        size: xml.len() as u64,
+        inline_data: Some(xml.into_bytes()),
+        source_is_nsp_like,
+    });
+    Ok(())
+}
+
+fn generate_xml_via_python_container(source_path: &str, meta_name: &str) -> Result<Option<Vec<u8>>> {
+    let ztools = std::env::var("NSCB_PY_ZTOOLS").unwrap_or_else(|_| "/tmp/NSC_BUILDER_cfx/py/ztools".to_string());
+    if !Path::new(&ztools).is_dir() {
+        return Ok(None);
+    }
+    let python_bin = std::env::var("NSCB_PYTHON").unwrap_or_else(|_| {
+        let venv = "/tmp/NSC_BUILDER_cfx/.venv/bin/python";
+        if Path::new(venv).is_file() {
+            venv.to_string()
+        } else {
+            "python".to_string()
+        }
+    });
+    let outdir = tempfile::tempdir()?;
+    let out_path = outdir.path().to_string_lossy().to_string();
+    let py = r#"
+import os, sys
+ztools = sys.argv[1]
+container = sys.argv[2]
+outd = sys.argv[3]
+meta_name = sys.argv[4]
+os.chdir(ztools)
+sys.path.insert(0, ztools)
+sys.path.insert(0, os.path.join(ztools, 'lib'))
+import sq_settings
+sq_settings.set_prod_environment()
+import Fs
+cl = container.lower()
+if cl.endswith('.xci') or cl.endswith('.xcz'):
+    f = Fs.Xci(container)
+else:
+    f = Fs.Nsp(container)
+_ = f.get_content(outd, False, True)
+xmlp = os.path.join(outd, meta_name[:-3] + 'xml')
+if os.path.exists(xmlp):
+    print(xmlp)
+"#;
+    let out = Command::new(&python_bin)
+        .arg("-c")
+        .arg(py)
+        .arg(&ztools)
+        .arg(source_path)
+        .arg(&out_path)
+        .arg(meta_name)
+        .output();
+    let Ok(out) = out else {
+        return Ok(None);
+    };
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let xml_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if xml_path.is_empty() || !Path::new(&xml_path).is_file() {
+        return Ok(None);
+    }
+    Ok(Some(std::fs::read(xml_path)?))
+}
+
+fn generate_xml_via_python(
+    file: &mut BufReader<File>,
+    abs_offset: u64,
+    size: u64,
+    meta_name: &str,
+) -> Result<Option<Vec<u8>>> {
+    let ztools = std::env::var("NSCB_PY_ZTOOLS").unwrap_or_else(|_| "/tmp/NSC_BUILDER_cfx/py/ztools".to_string());
+    if !Path::new(&ztools).is_dir() {
+        return Ok(None);
+    }
+    let python_bin = std::env::var("NSCB_PYTHON").unwrap_or_else(|_| {
+        let venv = "/tmp/NSC_BUILDER_cfx/.venv/bin/python";
+        if Path::new(venv).is_file() {
+            venv.to_string()
+        } else {
+            "python".to_string()
+        }
+    });
+
+    let outdir = tempfile::tempdir()?;
+    let out_path = outdir.path().to_string_lossy().to_string();
+    let nca_path = outdir.path().join(meta_name);
+    let mut nca_file = File::create(&nca_path)?;
+    file.seek(SeekFrom::Start(abs_offset))?;
+    std::io::copy(&mut file.by_ref().take(size), &mut nca_file)?;
+    let nca_path_s = nca_path.to_string_lossy().to_string();
+    let py = r#"
+import hashlib, os, sys
+ztools = sys.argv[1]
+nca = sys.argv[2]
+outd = sys.argv[3]
+meta_name = sys.argv[4]
+os.chdir(ztools)
+sys.path.insert(0, ztools)
+sys.path.insert(0, os.path.join(ztools, 'lib'))
+import sq_settings
+sq_settings.set_prod_environment()
+import Fs
+nca_plain = os.path.join(outd, meta_name)
+src = Fs.Nca(nca, 'r+b')
+src.rewind()
+with open(nca_plain, 'w+b') as fp:
+    while True:
+        data = src.read(32768)
+        if not data:
+            break
+        fp.write(data)
+        fp.flush()
+f = Fs.Nca(nca_plain, 'r+b')
+f.rewind()
+b = f.read()
+nsha = hashlib.sha256(b).hexdigest()
+f.rewind()
+xml = f.xml_gen(outd, nsha)
+print(xml)
+"#;
+    let out = Command::new(&python_bin)
+        .arg("-c")
+        .arg(py)
+        .arg(&ztools)
+        .arg(&nca_path_s)
+        .arg(&out_path)
+        .arg(meta_name)
+        .output();
+    let Ok(out) = out else {
+        return Ok(None);
+    };
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let xml_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if xml_path.is_empty() || !Path::new(&xml_path).is_file() {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(xml_path)?;
+    Ok(Some(bytes))
+}
+
+fn parse_meta_xml_info(
+    file: &mut BufReader<File>,
+    abs_offset: u64,
+    nca_size: u64,
+    ks: &KeyStore,
+) -> Result<Option<(Cnmt, [u8; 32], u8, u8, String)>> {
+    let mut nca_bytes = vec![0u8; nca_size as usize];
+    file.seek(SeekFrom::Start(abs_offset))?;
+    file.read_exact(&mut nca_bytes)?;
+    let nsha = hex::encode(crate::crypto::hash::sha256(&nca_bytes));
+
+    let header = NcaHeader::from_encrypted(&nca_bytes[..0xC00], ks)?;
+    let keys = header.decrypt_key_area(ks)?;
+    let crypto2 = header.crypto_type2;
+    let keygen = header.crypto_type.max(header.crypto_type2);
+
+    for sec_idx in 0..4 {
+        let sec = &header.section_table[sec_idx];
+        if !sec.is_present() || sec.size() == 0 {
+            continue;
+        }
+        let rel = sec.start_offset() as usize;
+        let end = rel.saturating_add(sec.size() as usize);
+        if end > nca_bytes.len() {
+            continue;
+        }
+        let section = &nca_bytes[rel..end];
+        if let Some((cnmt, digest)) = parse_cnmt_and_digest_from_section(section) {
+            return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
+        }
+        let nonce = header.section_ctr_nonce(sec_idx);
+        for key in &keys {
+            let mut dec = section.to_vec();
+            aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
+            if let Some((cnmt, digest)) = parse_cnmt_and_digest_from_section(&dec) {
+                return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
+            }
+        }
+    }
+
+    if let Some(cnmt) = parse_cnmt_from_meta_nca_at(file, abs_offset, ks) {
+        return Ok(Some((cnmt, [0u8; 32], crypto2, keygen, nsha)));
+    }
+
+    Ok(None)
+}
+
+fn parse_cnmt_and_digest_from_section(section: &[u8]) -> Option<(Cnmt, [u8; 32])> {
+    for base in pfs0_candidate_offsets(section) {
+        let mut cur = std::io::Cursor::new(section);
+        let Ok(pfs) = Pfs0::parse_at(&mut cur, base as u64) else {
+            continue;
+        };
+        for e in &pfs.entries {
+            if e.name.ends_with(".cnmt") {
+                let start = pfs.file_abs_offset(e) as usize;
+                let end = start.saturating_add(e.size as usize);
+                if end > section.len() {
+                    continue;
+                }
+                let cnmt = Cnmt::from_bytes(&section[start..end]).ok()?;
+                let mut digest = [0u8; 32];
+                let pfs_end = pfs.total_size() as usize;
+                if pfs_end >= 32 && pfs_end <= section.len() {
+                    digest.copy_from_slice(&section[pfs_end - 32..pfs_end]);
+                }
+                return Some((cnmt, digest));
+            }
+        }
+    }
+    None
+}
+
+fn build_python_cnmt_xml(
+    meta_name: &str,
+    meta_size: u64,
+    cnmt: &Cnmt,
+    digest: &[u8; 32],
+    crypto2: u8,
+    keygen: u8,
+    nsha: &str,
+) -> String {
+    let title_type = match cnmt.title_type {
+        0x01 => "SystemProgram",
+        0x02 => "SystemData",
+        0x03 => "SystemUpdate",
+        0x04 => "BootImagePackage",
+        0x05 => "BootImagePackageSafe",
+        0x80 => "Application",
+        0x81 => "Patch",
+        0x82 => "AddOnContent",
+        0x83 => "Delta",
+        _ => "Application",
+    };
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    out.push_str("<ContentMeta>\n");
+    out.push_str(&format!("  <Type>{}</Type>\n", title_type));
+    out.push_str(&format!("  <Id>0x{:016x}</Id>\n", cnmt.title_id));
+    out.push_str(&format!("  <Version>{}</Version>\n", cnmt.version));
+    let rdsv = u64::from_le_bytes(cnmt.raw[0x18..0x20].try_into().unwrap_or([0u8; 8]));
+    out.push_str(&format!(
+        "  <RequiredDownloadSystemVersion>{}</RequiredDownloadSystemVersion>\n",
+        rdsv
+    ));
+    for c in &cnmt.content_entries {
+        let ct = match c.content_type {
+            0 => "Meta",
+            1 => "Program",
+            2 => "Data",
+            3 => "Control",
+            4 => "HtmlDocument",
+            5 => "LegalInformation",
+            6 => "DeltaFragment",
+            _ => "Data",
+        };
+        out.push_str("  <Content>\n");
+        out.push_str(&format!("    <Type>{}</Type>\n", ct));
+        out.push_str(&format!("    <Id>{}</Id>\n", c.nca_id()));
+        out.push_str(&format!("    <Size>{}</Size>\n", c.size));
+        out.push_str(&format!("    <Hash>{}</Hash>\n", hex::encode(c.hash)));
+        out.push_str(&format!("    <KeyGeneration>{}</KeyGeneration>\n", crypto2));
+        out.push_str("  </Content>\n");
+    }
+    let metaname = meta_name.trim_end_matches(".cnmt.nca");
+    out.push_str("  <Content>\n");
+    out.push_str("    <Type>Meta</Type>\n");
+    out.push_str(&format!("    <Id>{}</Id>\n", metaname));
+    out.push_str(&format!("    <Size>{}</Size>\n", meta_size));
+    out.push_str(&format!("    <Hash>{}</Hash>\n", nsha));
+    out.push_str(&format!("    <KeyGeneration>{}</KeyGeneration>\n", keygen));
+    out.push_str("  </Content>\n");
+    out.push_str(&format!("  <Digest>{}</Digest>\n", hex::encode(digest)));
+    out.push_str(&format!("  <KeyGenerationMin>{}</KeyGenerationMin>\n", keygen));
+    let min_rsv = u32::from_le_bytes(cnmt.raw[0x28..0x2C].try_into().unwrap_or([0u8; 4]));
+    out.push_str(&format!(
+        "  <RequiredSystemVersion>{}</RequiredSystemVersion>\n",
+        min_rsv
+    ));
+    let original_id = u64::from_le_bytes(cnmt.raw[0x20..0x28].try_into().unwrap_or([0u8; 8]));
+    out.push_str(&format!("  <OriginalId>0x{:016x}</OriginalId>\n", original_id));
+    out.push_str("</ContentMeta>");
+    out
+}
+
+fn aes_ctr_transform_in_place(key: &[u8; 16], nonce8: &[u8; 8], file_offset: u64, data: &mut [u8]) {
+    let Ok(cipher) = Aes128::new_from_slice(key) else {
+        return;
+    };
+    let mut cached_block_index = u64::MAX;
+    let mut cached_keystream = [0u8; 16];
+    for (i, byte) in data.iter_mut().enumerate() {
+        let abs = file_offset + i as u64;
+        let block_index = abs / 16;
+        let byte_in_block = (abs % 16) as usize;
+        if block_index != cached_block_index {
+            let mut ctr = [0u8; 16];
+            ctr[..8].copy_from_slice(nonce8);
+            ctr[8..].copy_from_slice(&block_index.to_be_bytes());
+            let mut block = aes::Block::from(ctr);
+            cipher.encrypt_block(&mut block);
+            cached_keystream.copy_from_slice(&block);
+            cached_block_index = block_index;
+        }
+        *byte ^= cached_keystream[byte_in_block];
+    }
+}
+
+fn parse_cnmt_from_meta_nca_at(
+    file: &mut BufReader<File>,
+    abs_offset: u64,
+    ks: &KeyStore,
+) -> Option<Cnmt> {
+    let header = NcaHeader::from_reader(file, abs_offset, ks).ok()?;
+    let keys = header.decrypt_key_area(ks).ok()?;
+    for sec_idx in 0..4 {
+        let sec = &header.section_table[sec_idx];
+        if !sec.is_present() || sec.size() == 0 {
+            continue;
+        }
+        let sec_abs = abs_offset + sec.start_offset();
+        let mut section = vec![0u8; sec.size() as usize];
+        file.seek(SeekFrom::Start(sec_abs)).ok()?;
+        file.read_exact(&mut section).ok()?;
+        if let Some(cnmt) = parse_cnmt_from_section_bytes(&section) {
+            return Some(cnmt);
+        }
+        let nonce = header.section_ctr_nonce(sec_idx);
+        for key in &keys {
+            let mut dec = section.clone();
+            aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
+            if let Some(cnmt) = parse_cnmt_from_section_bytes(&dec) {
+                return Some(cnmt);
+            }
+        }
+    }
+    None
+}
+
+fn parse_cnmt_from_section_bytes(section: &[u8]) -> Option<Cnmt> {
+    for off in pfs0_candidate_offsets(section) {
+        let mut cursor = std::io::Cursor::new(section);
+        let Ok(pfs) = Pfs0::parse_at(&mut cursor, off as u64) else {
+            continue;
+        };
+        for entry in &pfs.entries {
+            if entry.name.ends_with(".cnmt") {
+                let abs = pfs.file_abs_offset(entry) as usize;
+                let end = abs.saturating_add(entry.size as usize);
+                if end > section.len() {
+                    continue;
+                }
+                if let Ok(cnmt) = Cnmt::from_bytes(&section[abs..end]) {
+                    return Some(cnmt);
+                }
+            }
+        }        
+    }
+    None
+}
+
+fn pfs0_candidate_offsets(section: &[u8]) -> Vec<usize> {
+    let mut out = vec![0usize];
+    let scan_len = section.len().min(1024 * 1024);
+    if scan_len >= 4 {
+        for i in 0..=(scan_len - 4) {
+            if &section[i..i + 4] == b"PFS0" {
+                out.push(i);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn build_xci_output(
