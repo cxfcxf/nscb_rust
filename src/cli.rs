@@ -76,7 +76,17 @@ pub fn dispatch(args: Args) -> Result<()> {
 
     // Dispatch to the correct operation
     if let Some(files) = &args.direct_multi {
-        let file_refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
+        let filtered_files: Vec<&str> = files
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|p| !is_ignored_merge_input_path(p))
+            .collect();
+        if filtered_files.is_empty() {
+            return Err(crate::error::NscbError::InvalidData(
+                "No valid input files after filtering metadata sidecar entries".to_string(),
+            ));
+        }
+        let file_refs: Vec<&str> = filtered_files.clone();
         let merge_name = build_merge_filename_metadata(&file_refs, &args.output_type, &ks)
             .unwrap_or_else(|| build_merge_filename(&file_refs, &args.output_type));
         let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp")
@@ -85,7 +95,7 @@ pub fn dispatch(args: Args) -> Result<()> {
                 lower.ends_with(".xci") || lower.ends_with(".xcz")
             });
         let output = make_output_path(
-            files.first().map(|s| s.as_str()).unwrap_or("merged"),
+            filtered_files.first().copied().unwrap_or("merged"),
             &args.ofolder,
             &merge_name,
         );
@@ -134,14 +144,148 @@ pub fn dispatch(args: Args) -> Result<()> {
 
 /// Build output path: if ofolder is set, put the file there; otherwise use the derived name.
 fn make_output_path(_input: &str, ofolder: &Option<String>, default_name: &str) -> String {
+    let file_name = Path::new(default_name)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let safe_file_name = sanitize_output_filename(&file_name);
+
     if let Some(dir) = ofolder {
-        let name = Path::new(default_name)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        Path::new(dir).join(name.as_ref()).to_string_lossy().into()
+        Path::new(dir)
+            .join(safe_file_name.as_str())
+            .to_string_lossy()
+            .into()
     } else {
-        default_name.to_string()
+        // If the generated output name contains invalid filesystem characters,
+        // keep it in the current directory with a safe basename.
+        safe_file_name
+    }
+}
+
+fn sanitize_output_filename(name: &str) -> String {
+    let (stem, ext) = if let Some((s, e)) = name.rsplit_once('.') {
+        (s.to_string(), format!(".{}", e))
+    } else {
+        (name.to_string(), String::new())
+    };
+    let mut out = stem;
+    // Mirror squirrel.py cleanup used for generated output names.
+    out = Regex::new(r"[\/\\:\*\?]+")
+        .unwrap()
+        .replace_all(&out, "")
+        .to_string();
+    out = Regex::new(r#"[™©®`~\^´ªº¢#£€¥$ƒ±¬½¼♡«»•²‰œæÆ³☆<>|]"#)
+        .unwrap()
+        .replace_all(&out, "")
+        .to_string();
+
+    let translits = [
+        ("Ⅰ", "I"),
+        ("Ⅱ", "II"),
+        ("Ⅲ", "III"),
+        ("Ⅳ", "IV"),
+        ("Ⅴ", "V"),
+        ("Ⅵ", "VI"),
+        ("Ⅶ", "VII"),
+        ("Ⅷ", "VIII"),
+        ("Ⅸ", "IX"),
+        ("Ⅹ", "X"),
+        ("Ⅺ", "XI"),
+        ("Ⅻ", "XII"),
+        ("Ⅼ", "L"),
+        ("Ⅽ", "C"),
+        ("Ⅾ", "D"),
+        ("Ⅿ", "M"),
+        ("—", "-"),
+        ("√", "Root"),
+        ("à", "a"),
+        ("â", "a"),
+        ("á", "a"),
+        ("@", "a"),
+        ("ä", "a"),
+        ("å", "a"),
+        ("À", "A"),
+        ("Â", "A"),
+        ("Á", "A"),
+        ("Ä", "A"),
+        ("Å", "A"),
+        ("è", "e"),
+        ("ê", "e"),
+        ("é", "e"),
+        ("ë", "e"),
+        ("È", "E"),
+        ("Ê", "E"),
+        ("É", "E"),
+        ("Ë", "E"),
+        ("ì", "i"),
+        ("î", "i"),
+        ("í", "i"),
+        ("ï", "i"),
+        ("Ì", "I"),
+        ("Î", "I"),
+        ("Í", "I"),
+        ("Ï", "I"),
+        ("ò", "o"),
+        ("ô", "o"),
+        ("ó", "o"),
+        ("ö", "o"),
+        ("ø", "o"),
+        ("Ò", "O"),
+        ("Ô", "O"),
+        ("Ó", "O"),
+        ("Ö", "O"),
+        ("Ø", "O"),
+        ("ù", "u"),
+        ("û", "u"),
+        ("ú", "u"),
+        ("ü", "u"),
+        ("Ù", "U"),
+        ("Û", "U"),
+        ("Ú", "U"),
+        ("Ü", "U"),
+        ("’", "'"),
+        ("“", "\""),
+        ("”", "\""),
+    ];
+    for (from, to) in translits {
+        out = out.replace(from, to);
+    }
+
+    out = Regex::new(r" {3,}")
+        .unwrap()
+        .replace_all(&out, " ")
+        .to_string();
+    out = out.replace("( ", "(");
+    out = out.replace(" )", ")");
+    out = out.replace("[ ", "[");
+    out = out.replace(" ]", "]");
+    out = out.replace("[ (", "[(");
+    out = out.replace(") ]", ")]");
+    out = out.replace("[]", "");
+    out = out.replace("()", "");
+    out = out.replace("\" ", "\"");
+    out = out.replace(" \"", "\"");
+    out = out.replace(" !", "!");
+    out = out.replace(" ?", "?");
+    out = out.replace("  ", " ");
+    out = out.replace("  ", " ");
+    out = out.replace('"', "");
+    out = out.replace(")", ") ");
+    out = out.replace("]", "] ");
+    out = out.replace("[ (", "[(");
+    out = out.replace(") ]", ")]");
+    out = out.replace("  ", " ");
+    out = out.trim_end().to_string();
+
+    if out.is_empty() {
+        if ext.is_empty() {
+            "merged.nsp".to_string()
+        } else {
+            format!("merged{}", ext)
+        }
+    } else {
+        format!("{}{}", out, ext)
     }
 }
 
@@ -185,6 +329,7 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
     let mut game_count = 0u32;
     let mut update_count = 0u32;
     let mut dlc_count = 0u32;
+    let mut considered_count = 0usize;
 
     // Regex to extract title ID from filenames like [0100633007D48000] or -0100633007D48000-
     let tid_re = Regex::new(r"[\[-]([0-9A-Fa-f]{16})[\]-]").unwrap();
@@ -196,6 +341,10 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
     let dlc_re = Regex::new(r"(?i)\[DLC\]").unwrap();
 
     for path_str in input_paths {
+        if is_ignored_merge_input_path(path_str) {
+            continue;
+        }
+        considered_count += 1;
         let filename = Path::new(path_str)
             .file_stem()
             .unwrap_or_default()
@@ -293,7 +442,7 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
         parts.push(format!("{}D", dlc_count));
     }
     let summary = if parts.is_empty() {
-        format!("{}F", input_paths.len())
+        format!("{}F", considered_count)
     } else {
         parts.join("+")
     };
@@ -302,6 +451,14 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
         "{} [{}] [v{}] ({}).{}",
         name, tid, ver, summary, output_type
     )
+}
+
+fn is_ignored_merge_input_path(path_str: &str) -> bool {
+    let name = Path::new(path_str)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    name.starts_with("._") || name.eq_ignore_ascii_case(".ds_store")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,6 +572,9 @@ fn collect_title_records(
     let mut effective_paths: Vec<String> = Vec::new();
 
     for path_str in input_paths {
+        if is_ignored_merge_input_path(path_str) {
+            continue;
+        }
         let ext = Path::new(path_str)
             .extension()
             .and_then(|e| e.to_str())
@@ -723,7 +883,7 @@ fn infer_game_name_from_path(path_str: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_merge_filename;
+    use super::{build_merge_filename, sanitize_output_filename};
 
     #[test]
     fn merge_filename_counts_dlc_without_dlc_tag() {
@@ -750,5 +910,19 @@ mod tests {
         ];
         let out = build_merge_filename(&inputs, "nsp");
         assert!(out.contains("(1G+1U).nsp"), "actual output: {}", out);
+    }
+
+    #[test]
+    fn sanitize_filename_removes_windows_unsafe_chars_like_squirrel() {
+        let out = sanitize_output_filename("Hollow Knight: Silksong [010013C00E930000].xci");
+        assert!(
+            !out.contains(':'),
+            "sanitized output must not contain ':'; got {}",
+            out
+        );
+        assert_eq!(
+            out,
+            "Hollow Knight Silksong [010013C00E930000].xci".to_string()
+        );
     }
 }
