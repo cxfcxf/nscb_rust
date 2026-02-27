@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::LazyLock;
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
@@ -17,6 +18,10 @@ use crate::formats::types::TitleType;
 use crate::formats::xci::Xci;
 use crate::keys::KeyStore;
 use crate::util::{io as uio, progress};
+
+static BRACKET_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*\[[^\]]*\]").unwrap());
+static PAREN_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s*\([^)]*\)").unwrap());
+static VERSION_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[v(\d+)\]").unwrap());
 
 /// Split a multi-title NSP/XCI into separate NSP files by base title ID.
 pub fn split(input_path: &str, output_dir: &str, ks: &KeyStore) -> Result<()> {
@@ -237,10 +242,8 @@ fn infer_game_name_from_input(input_path: &str) -> String {
         .to_string();
 
     // Remove trailing tag blocks like [..] and (..), then trim separators.
-    let bracket_re = Regex::new(r"\s*\[[^\]]*\]").unwrap();
-    let paren_re = Regex::new(r"\s*\([^)]*\)").unwrap();
-    let mut s = bracket_re.replace_all(&stem, "").to_string();
-    s = paren_re.replace_all(&s, "").to_string();
+    let mut s = BRACKET_TAG_RE.replace_all(&stem, "").to_string();
+    s = PAREN_TAG_RE.replace_all(&s, "").to_string();
     let s = s
         .trim()
         .trim_matches(|c: char| c == '-' || c == '_' || c.is_whitespace());
@@ -271,9 +274,8 @@ fn infer_version_from_input(input_path: &str) -> Option<u32> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    let re = Regex::new(r"\[v(\d+)\]").unwrap();
     let mut last: Option<u32> = None;
-    for cap in re.captures_iter(stem) {
+    for cap in VERSION_TAG_RE.captures_iter(stem) {
         if let Ok(v) = cap[1].parse::<u32>() {
             last = Some(v);
         }
