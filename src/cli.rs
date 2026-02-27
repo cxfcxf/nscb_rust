@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::LazyLock;
 
 use crate::error::Result;
 use crate::formats::nsp::Nsp;
@@ -11,6 +12,19 @@ use crate::formats::xci::Xci;
 use crate::keys::KeyStore;
 
 use regex::Regex;
+
+static INVALID_FS_CHARS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\/\\:\*\?]+").unwrap());
+static SYMBOL_STRIP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"[™©®`~\^´ªº¢#£€¥$ƒ±¬½¼♡«»•²‰œæÆ³☆<>|]"#).unwrap());
+static MULTI_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {3,}").unwrap());
+static TITLE_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[\[-]([0-9A-Fa-f]{16})[\]-]").unwrap());
+static VERSION_BRACKET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[v(\d+)\]").unwrap());
+static VERSION_DASH_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"--v(\d+)-").unwrap());
+static NUM_BRACKET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[(\d+)\]").unwrap());
+static UPD_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[UPD\]").unwrap());
+static DLC_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\[DLC\]").unwrap());
 
 #[derive(Parser, Debug)]
 #[command(name = "nscb", version, about = "Nintendo Switch Content Builder")]
@@ -86,11 +100,10 @@ pub fn dispatch(args: Args) -> Result<()> {
                 "No valid input files after filtering metadata sidecar entries".to_string(),
             ));
         }
-        let file_refs: Vec<&str> = filtered_files.clone();
-        let merge_name = build_merge_filename_metadata(&file_refs, &args.output_type, &ks)
-            .unwrap_or_else(|| build_merge_filename(&file_refs, &args.output_type));
+        let merge_name = build_merge_filename_metadata(&filtered_files, &args.output_type, &ks)
+            .unwrap_or_else(|| build_merge_filename(&filtered_files, &args.output_type));
         let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp")
-            && file_refs.iter().any(|p| {
+            && filtered_files.iter().any(|p| {
                 let lower = p.to_ascii_lowercase();
                 lower.ends_with(".xci") || lower.ends_with(".xcz")
             });
@@ -100,7 +113,7 @@ pub fn dispatch(args: Args) -> Result<()> {
             &merge_name,
         );
         return crate::ops::merge::merge(
-            &file_refs,
+            &filtered_files,
             &output,
             &ks,
             args.nodelta,
@@ -171,14 +184,8 @@ fn sanitize_output_filename(name: &str) -> String {
     };
     let mut out = stem;
     // Mirror squirrel.py cleanup used for generated output names.
-    out = Regex::new(r"[\/\\:\*\?]+")
-        .unwrap()
-        .replace_all(&out, "")
-        .to_string();
-    out = Regex::new(r#"[™©®`~\^´ªº¢#£€¥$ƒ±¬½¼♡«»•²‰œæÆ³☆<>|]"#)
-        .unwrap()
-        .replace_all(&out, "")
-        .to_string();
+    out = INVALID_FS_CHARS_RE.replace_all(&out, "").to_string();
+    out = SYMBOL_STRIP_RE.replace_all(&out, "").to_string();
 
     let translits = [
         ("Ⅰ", "I"),
@@ -252,10 +259,7 @@ fn sanitize_output_filename(name: &str) -> String {
         out = out.replace(from, to);
     }
 
-    out = Regex::new(r" {3,}")
-        .unwrap()
-        .replace_all(&out, " ")
-        .to_string();
+    out = MULTI_SPACE_RE.replace_all(&out, " ").to_string();
     out = out.replace("( ", "(");
     out = out.replace(" )", ")");
     out = out.replace("[ ", "[");
@@ -331,15 +335,6 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
     let mut dlc_count = 0u32;
     let mut considered_count = 0usize;
 
-    // Regex to extract title ID from filenames like [0100633007D48000] or -0100633007D48000-
-    let tid_re = Regex::new(r"[\[-]([0-9A-Fa-f]{16})[\]-]").unwrap();
-    // Regex to extract version: [v458752] in brackets, or --v\d+- in dash format
-    let ver_bracket_re = Regex::new(r"\[v(\d+)\]").unwrap();
-    let ver_dash_re = Regex::new(r"--v(\d+)-").unwrap();
-    // Regex to detect content type tags
-    let upd_re = Regex::new(r"(?i)\[UPD\]").unwrap();
-    let dlc_re = Regex::new(r"(?i)\[DLC\]").unwrap();
-
     for path_str in input_paths {
         if is_ignored_merge_input_path(path_str) {
             continue;
@@ -366,7 +361,7 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
         }
 
         // Extract title IDs
-        let title_ids: Vec<String> = tid_re
+        let title_ids: Vec<String> = TITLE_ID_RE
             .captures_iter(&filename)
             .map(|c| c[1].to_uppercase())
             .collect();
@@ -382,8 +377,8 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
             .iter()
             .any(|tid| !tid.ends_with("800") && !tid.ends_with("000"));
 
-        let is_update = upd_re.is_match(&filename) || has_update_tid;
-        let is_dlc = dlc_re.is_match(&filename) || (!is_update && has_dlc_tid && !has_base_tid);
+        let is_update = UPD_TAG_RE.is_match(&filename) || has_update_tid;
+        let is_dlc = DLC_TAG_RE.is_match(&filename) || (!is_update && has_dlc_tid && !has_base_tid);
         let is_base = !is_update && !is_dlc;
 
         // Title ID heuristic: base ends in 000, update ends in 800, DLC is between
@@ -400,9 +395,9 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
         }
 
         // Extract version — prefer bracketed [v458752], fall back to --v0-
-        let ver_cap = ver_bracket_re
+        let ver_cap = VERSION_BRACKET_RE
             .captures(&filename)
-            .or_else(|| ver_dash_re.captures(&filename));
+            .or_else(|| VERSION_DASH_RE.captures(&filename));
         if let Some(cap) = ver_cap {
             let ver: u64 = cap[1].parse().unwrap_or(0);
             if let Some(ref cur) = latest_version {
@@ -793,13 +788,6 @@ fn add_filename_fallback_records(
     out: &mut HashMap<u64, MergeTitleRecord>,
     latest_version: &mut Option<u32>,
 ) {
-    let tid_re = Regex::new(r"[\[-]([0-9A-Fa-f]{16})[\]-]").unwrap();
-    let ver_bracket_re = Regex::new(r"\[v(\d+)\]").unwrap();
-    let ver_dash_re = Regex::new(r"--v(\d+)-").unwrap();
-    let num_bracket_re = Regex::new(r"\[(\d+)\]").unwrap();
-    let upd_re = Regex::new(r"(?i)\[UPD\]").unwrap();
-    let dlc_re = Regex::new(r"(?i)\[DLC\]").unwrap();
-
     for path_str in input_paths {
         let filename = Path::new(path_str)
             .file_stem()
@@ -807,7 +795,7 @@ fn add_filename_fallback_records(
             .to_string_lossy()
             .to_string();
 
-        let tid = tid_re
+        let tid = TITLE_ID_RE
             .captures_iter(&filename)
             .next()
             .and_then(|c| u64::from_str_radix(&c[1], 16).ok());
@@ -817,22 +805,22 @@ fn add_filename_fallback_records(
 
         let has_update_tid = (title_id & 0xFFF) == 0x800;
         let has_base_tid = (title_id & 0xFFF) == 0x000;
-        let kind = if upd_re.is_match(&filename) || has_update_tid {
+        let kind = if UPD_TAG_RE.is_match(&filename) || has_update_tid {
             MergeKind::Update
-        } else if dlc_re.is_match(&filename) || !has_base_tid {
+        } else if DLC_TAG_RE.is_match(&filename) || !has_base_tid {
             MergeKind::Dlc
         } else {
             MergeKind::Base
         };
 
-        let mut version = ver_bracket_re
+        let mut version = VERSION_BRACKET_RE
             .captures(&filename)
-            .or_else(|| ver_dash_re.captures(&filename))
+            .or_else(|| VERSION_DASH_RE.captures(&filename))
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<u32>().ok())
             .unwrap_or(0);
         if version == 0 {
-            for cap in num_bracket_re.captures_iter(&filename) {
+            for cap in NUM_BRACKET_RE.captures_iter(&filename) {
                 if let Ok(v) = cap[1].parse::<u32>() {
                     if v > version {
                         version = v;
