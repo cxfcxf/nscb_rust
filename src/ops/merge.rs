@@ -475,6 +475,25 @@ fn build_nsp_output(
     let pb = progress::file_progress(total, "Building NSP");
 
     let mut out = BufWriter::new(File::create(output_path)?);
+    let mut source_readers: HashMap<String, BufReader<File>> = HashMap::new();
+
+    fn copy_from_source(
+        readers: &mut HashMap<String, BufReader<File>>,
+        source_path: &str,
+        abs_offset: u64,
+        size: u64,
+        out: &mut BufWriter<File>,
+        pb: &indicatif::ProgressBar,
+    ) -> Result<()> {
+        use std::collections::hash_map::Entry;
+
+        let src = match readers.entry(source_path.to_string()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(BufReader::new(File::open(source_path)?)),
+        };
+        uio::copy_section(src, out, abs_offset, size, Some(pb))?;
+        Ok(())
+    }
 
     // Write PFS0 header
     out.write_all(&header)?;
@@ -491,17 +510,35 @@ fn build_nsp_output(
                     Some(*nca)
                 };
                 if let Some(entry) = to_write {
-                    let mut src = BufReader::new(File::open(&entry.source_path)?);
-                    uio::copy_section(&mut src, &mut out, entry.abs_offset, entry.size, Some(&pb))?;
+                    copy_from_source(
+                        &mut source_readers,
+                        &entry.source_path,
+                        entry.abs_offset,
+                        entry.size,
+                        &mut out,
+                        &pb,
+                    )?;
                 }
             }
             Item::Ticket(tik) => {
-                let mut src = BufReader::new(File::open(&tik.source_path)?);
-                uio::copy_section(&mut src, &mut out, tik.abs_offset, tik.size, Some(&pb))?;
+                copy_from_source(
+                    &mut source_readers,
+                    &tik.source_path,
+                    tik.abs_offset,
+                    tik.size,
+                    &mut out,
+                    &pb,
+                )?;
             }
             Item::Cert(cert) => {
-                let mut src = BufReader::new(File::open(&cert.source_path)?);
-                uio::copy_section(&mut src, &mut out, cert.abs_offset, cert.size, Some(&pb))?;
+                copy_from_source(
+                    &mut source_readers,
+                    &cert.source_path,
+                    cert.abs_offset,
+                    cert.size,
+                    &mut out,
+                    &pb,
+                )?;
             }
             Item::Xml(xml) => {
                 if python_direct_multi_mode && !xml.source_is_nsp_like {
@@ -511,8 +548,14 @@ fn build_nsp_output(
                     out.write_all(bytes)?;
                     pb.inc(bytes.len() as u64);
                 } else if let (Some(source_path), Some(abs_offset)) = (&xml.source_path, xml.abs_offset) {
-                    let mut src = BufReader::new(File::open(source_path)?);
-                    uio::copy_section(&mut src, &mut out, abs_offset, xml.size, Some(&pb))?;
+                    copy_from_source(
+                        &mut source_readers,
+                        source_path,
+                        abs_offset,
+                        xml.size,
+                        &mut out,
+                        &pb,
+                    )?;
                 }
             }
         }
