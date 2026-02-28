@@ -10,10 +10,13 @@ fn forced_draw_target() -> ProgressDrawTarget {
 
 fn env_truthy(name: &str) -> bool {
     match env::var(name) {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
+        Ok(v) => {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        }
         Err(_) => false,
     }
 }
