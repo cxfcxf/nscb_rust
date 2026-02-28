@@ -955,8 +955,9 @@ fn parse_cnmt_from_meta_nca_at(
             return Some(cnmt);
         }
         let nonce = header.section_ctr_nonce(sec_idx);
+        let mut dec = vec![0u8; section.len()];
         for key in &keys {
-            let mut dec = section.clone();
+            dec.copy_from_slice(&section);
             aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
             if let Some(cnmt) = parse_cnmt_from_section_bytes(&dec) {
                 return Some(cnmt);
@@ -994,13 +995,39 @@ fn pfs0_candidate_offsets(section: &[u8]) -> Vec<usize> {
     if scan_len >= 4 {
         for i in 0..=(scan_len - 4) {
             if &section[i..i + 4] == b"PFS0" {
-                out.push(i);
+                if i != 0 {
+                    out.push(i);
+                }
             }
         }
     }
-    out.sort_unstable();
-    out.dedup();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pfs0_candidate_offsets;
+
+    #[test]
+    fn pfs0_offsets_include_zero_and_signature_positions() {
+        let mut section = vec![0u8; 32];
+        section[8..12].copy_from_slice(b"PFS0");
+        section[20..24].copy_from_slice(b"PFS0");
+
+        let offsets = pfs0_candidate_offsets(&section);
+
+        assert_eq!(offsets, vec![0, 8, 20]);
+    }
+
+    #[test]
+    fn pfs0_offsets_do_not_duplicate_zero() {
+        let mut section = vec![0u8; 8];
+        section[0..4].copy_from_slice(b"PFS0");
+
+        let offsets = pfs0_candidate_offsets(&section);
+
+        assert_eq!(offsets, vec![0]);
+    }
 }
 
 fn build_xci_output(
