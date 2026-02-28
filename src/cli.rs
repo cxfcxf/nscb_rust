@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::error::Result;
 use crate::formats::nsp::Nsp;
@@ -86,7 +87,7 @@ pub fn dispatch(args: Args) -> Result<()> {
                 "No valid input files after filtering metadata sidecar entries".to_string(),
             ));
         }
-        let file_refs: Vec<&str> = filtered_files.clone();
+        let file_refs = filtered_files.as_slice();
         let merge_name = build_merge_filename_metadata(&file_refs, &args.output_type, &ks)
             .unwrap_or_else(|| build_merge_filename(&file_refs, &args.output_type));
         let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp")
@@ -171,14 +172,8 @@ fn sanitize_output_filename(name: &str) -> String {
     };
     let mut out = stem;
     // Mirror squirrel.py cleanup used for generated output names.
-    out = Regex::new(r"[\/\\:\*\?]+")
-        .unwrap()
-        .replace_all(&out, "")
-        .to_string();
-    out = Regex::new(r#"[™©®`~\^´ªº¢#£€¥$ƒ±¬½¼♡«»•²‰œæÆ³☆<>|]"#)
-        .unwrap()
-        .replace_all(&out, "")
-        .to_string();
+    out = invalid_path_chars_re().replace_all(&out, "").to_string();
+    out = disallowed_symbols_re().replace_all(&out, "").to_string();
 
     let translits = [
         ("Ⅰ", "I"),
@@ -252,16 +247,13 @@ fn sanitize_output_filename(name: &str) -> String {
         out = out.replace(from, to);
     }
 
-    out = Regex::new(r" {3,}")
-        .unwrap()
-        .replace_all(&out, " ")
-        .to_string();
+    out = repeated_spaces_re().replace_all(&out, " ").to_string();
     out = out.replace("( ", "(");
     out = out.replace(" )", ")");
     out = out.replace("[ ", "[");
     out = out.replace(" ]", "]");
     out = out.replace("[ (", "[(");
-    out = out.replace(") ]", ")]");
+    out = out.replace(") ]", ")]\");
     out = out.replace("[]", "");
     out = out.replace("()", "");
     out = out.replace("\" ", "\"");
@@ -274,7 +266,7 @@ fn sanitize_output_filename(name: &str) -> String {
     out = out.replace(")", ") ");
     out = out.replace("]", "] ");
     out = out.replace("[ (", "[(");
-    out = out.replace(") ]", ")]");
+    out = out.replace(") ]", ")]\");
     out = out.replace("  ", " ");
     out = out.trim_end().to_string();
 
@@ -287,6 +279,24 @@ fn sanitize_output_filename(name: &str) -> String {
     } else {
         format!("{}{}", out, ext)
     }
+}
+
+fn invalid_path_chars_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[\/\\:\*\?]+").expect("valid invalid-path-chars regex"))
+}
+
+fn disallowed_symbols_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"[™©®`~\^´ªº¢#£€¥$ƒ±¬½¼♡«»•²‰œæÆ³☆<>|]"#)
+            .expect("valid disallowed-symbols regex")
+    })
+}
+
+fn repeated_spaces_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r" {3,}").expect("valid repeated-spaces regex"))
 }
 
 fn change_ext(path: &str, new_ext: &str) -> String {
