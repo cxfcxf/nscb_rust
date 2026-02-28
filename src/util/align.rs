@@ -8,7 +8,8 @@ pub fn align_up(n: u64, align: u64) -> u64 {
 /// How many padding bytes are needed to align `n` to `align`.
 #[inline]
 pub fn padding_needed(n: u64, align: u64) -> u64 {
-    align_up(n, align) - n
+    debug_assert!(align > 0 && align.is_power_of_two());
+    n.wrapping_neg() & (align - 1)
 }
 
 /// Round `n` down to the previous multiple of `align`.
