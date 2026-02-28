@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -91,36 +91,42 @@ fn collect_top_level_files(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn build_pack_order(mut files: Vec<PathBuf>, ks: &KeyStore) -> Vec<PathBuf> {
-    files.sort_by_key(|p| {
+    files.sort_by_cached_key(|p| {
         p.file_name()
             .map(|n| n.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default()
     });
 
+    let files: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .map(|p| {
+            let name = lower_name(&p);
+            (p, name)
+        })
+        .collect();
+
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     // 1) CNMT-driven NCA order (matches python ncalist_bycnmt behavior).
-    let mut id_to_file: Vec<(String, PathBuf)> = Vec::new();
-    for p in &files {
-        let name = lower_name(p);
+    let mut id_to_file: HashMap<String, usize> = HashMap::new();
+    for (idx, (_, name)) in files.iter().enumerate() {
         if name.ends_with(".nca") {
             if let Some(stem) = name.strip_suffix(".nca") {
-                id_to_file.push((stem.to_string(), p.clone()));
+                id_to_file.entry(stem.to_string()).or_insert(idx);
             }
         } else if name.ends_with(".ncz") {
             if let Some(stem) = name.strip_suffix(".ncz") {
-                id_to_file.push((stem.to_string(), p.clone()));
+                id_to_file.entry(stem.to_string()).or_insert(idx);
             }
         }
     }
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name) in &files {
         if name.ends_with(".cnmt.nca") {
             if let Some(cnmt) = parse_cnmt_from_meta_nca_file(p, ks) {
                 for nca_id in cnmt.nca_ids() {
-                    if let Some((_, fp)) = id_to_file.iter().find(|(id, _)| id == &nca_id) {
-                        push_unique(&mut out, &mut seen, fp.clone());
+                    if let Some(file_idx) = id_to_file.get(&nca_id) {
+                        push_unique(&mut out, &mut seen, files[*file_idx].0.clone());
                     }
                 }
             }
@@ -129,52 +135,50 @@ fn build_pack_order(mut files: Vec<PathBuf>, ks: &KeyStore) -> Vec<PathBuf> {
     // Fallback when CNMT parsing fails: place non-meta NCAs first (largest-first),
     // then meta NCA, mirroring python create behavior on these split folders.
     if out.is_empty() {
-        let mut non_meta: Vec<(u64, PathBuf)> = files
+        let mut non_meta: Vec<(u64, PathBuf, String)> = files
             .iter()
-            .filter(|p| {
-                let n = lower_name(p);
-                n.ends_with(".nca") && !n.ends_with(".cnmt.nca")
+            .filter(|(_, name)| name.ends_with(".nca") && !name.ends_with(".cnmt.nca"))
+            .map(|(path, name)| {
+                (
+                    path.metadata().map(|m| m.len()).unwrap_or(0),
+                    path.clone(),
+                    name.clone(),
+                )
             })
-            .map(|p| (p.metadata().map(|m| m.len()).unwrap_or(0), p.clone()))
             .collect();
         non_meta.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| lower_name(&a.1).cmp(&lower_name(&b.1)))
+            b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2))
         });
-        for (_, p) in non_meta {
+        for (_, p, _) in non_meta {
             push_unique(&mut out, &mut seen, p);
         }
     }
     // 2) Meta NCA(s)
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name) in &files {
         if name.ends_with(".cnmt.nca") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 3) .cnmt xml/plain
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name) in &files {
         if name.ends_with(".cnmt") || name.ends_with(".cnmt.xml") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 4) Images
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name) in &files {
         if name.ends_with(".jpg") || name.ends_with(".jpeg") || name.ends_with(".png") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 5) Tickets/certs
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name) in &files {
         if name.ends_with(".tik") || name.ends_with(".cert") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 6) Anything else
-    for p in files {
+    for (p, _) in files {
         push_unique(&mut out, &mut seen, p);
     }
 
@@ -321,5 +325,59 @@ fn aes_ctr_transform_in_place(key: &[u8; 16], nonce8: &[u8; 8], file_offset: u64
             cached_block_index = block_index;
         }
         *byte ^= cached_keystream[byte_in_block];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn build_pack_order_fallback_orders_non_meta_by_size_then_name() {
+        let dir = tempdir().unwrap();
+        let big = dir.path().join("bbb.nca");
+        let small = dir.path().join("aaa.nca");
+        let meta = dir.path().join("meta.cnmt.nca");
+        let cert = dir.path().join("title.cert");
+
+        fs::write(&big, vec![0u8; 8]).unwrap();
+        fs::write(&small, vec![0u8; 4]).unwrap();
+        fs::write(&meta, vec![0u8; 1]).unwrap();
+        fs::write(&cert, vec![0u8; 1]).unwrap();
+
+        let ks = KeyStore::from_string("").unwrap();
+        let ordered = build_pack_order(vec![cert, meta.clone(), small, big], &ks);
+
+        let names: Vec<String> = ordered
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(names, vec!["bbb.nca", "aaa.nca", "meta.cnmt.nca", "title.cert"]);
+    }
+
+    #[test]
+    fn build_pack_order_keeps_first_duplicate_file_id() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("abcd.nca");
+        let second = dir.path().join("abcd.ncz");
+        let meta = dir.path().join("meta.cnmt.nca");
+
+        fs::write(&first, vec![0u8; 8]).unwrap();
+        fs::write(&second, vec![0u8; 4]).unwrap();
+        fs::write(&meta, vec![0u8; 1]).unwrap();
+
+        let ks = KeyStore::from_string("").unwrap();
+        let ordered = build_pack_order(vec![second, first.clone(), meta], &ks);
+        let first_name = ordered
+            .first()
+            .and_then(|p| p.file_name())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(first_name, "abcd.nca");
     }
 }
