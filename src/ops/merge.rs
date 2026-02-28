@@ -395,6 +395,8 @@ fn build_nsp_output(
     xmls: &[XmlEntry],
     python_direct_multi_mode: bool,
 ) -> Result<()> {
+    let mut source_readers: HashMap<String, BufReader<File>> = HashMap::new();
+
     let mut nsp_backing_by_name: HashMap<String, &MergeEntry> = HashMap::new();
     if python_direct_multi_mode {
         for nca in ncas {
@@ -491,17 +493,17 @@ fn build_nsp_output(
                     Some(*nca)
                 };
                 if let Some(entry) = to_write {
-                    let mut src = BufReader::new(File::open(&entry.source_path)?);
-                    uio::copy_section(&mut src, &mut out, entry.abs_offset, entry.size, Some(&pb))?;
+                    let src = get_or_open_reader(&mut source_readers, &entry.source_path)?;
+                    uio::copy_section(src, &mut out, entry.abs_offset, entry.size, Some(&pb))?;
                 }
             }
             Item::Ticket(tik) => {
-                let mut src = BufReader::new(File::open(&tik.source_path)?);
-                uio::copy_section(&mut src, &mut out, tik.abs_offset, tik.size, Some(&pb))?;
+                let src = get_or_open_reader(&mut source_readers, &tik.source_path)?;
+                uio::copy_section(src, &mut out, tik.abs_offset, tik.size, Some(&pb))?;
             }
             Item::Cert(cert) => {
-                let mut src = BufReader::new(File::open(&cert.source_path)?);
-                uio::copy_section(&mut src, &mut out, cert.abs_offset, cert.size, Some(&pb))?;
+                let src = get_or_open_reader(&mut source_readers, &cert.source_path)?;
+                uio::copy_section(src, &mut out, cert.abs_offset, cert.size, Some(&pb))?;
             }
             Item::Xml(xml) => {
                 if python_direct_multi_mode && !xml.source_is_nsp_like {
@@ -511,8 +513,8 @@ fn build_nsp_output(
                     out.write_all(bytes)?;
                     pb.inc(bytes.len() as u64);
                 } else if let (Some(source_path), Some(abs_offset)) = (&xml.source_path, xml.abs_offset) {
-                    let mut src = BufReader::new(File::open(source_path)?);
-                    uio::copy_section(&mut src, &mut out, abs_offset, xml.size, Some(&pb))?;
+                    let src = get_or_open_reader(&mut source_readers, source_path)?;
+                    uio::copy_section(src, &mut out, abs_offset, xml.size, Some(&pb))?;
                 }
             }
         }
@@ -798,8 +800,9 @@ fn parse_meta_xml_info(
             return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
         }
         let nonce = header.section_ctr_nonce(sec_idx);
+        let mut dec = vec![0u8; section.len()];
         for key in &keys {
-            let mut dec = section.to_vec();
+            dec.copy_from_slice(section);
             aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
             if let Some((cnmt, digest)) = parse_cnmt_and_digest_from_section(&dec) {
                 return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
@@ -955,8 +958,9 @@ fn parse_cnmt_from_meta_nca_at(
             return Some(cnmt);
         }
         let nonce = header.section_ctr_nonce(sec_idx);
+        let mut dec = vec![0u8; section.len()];
         for key in &keys {
-            let mut dec = section.clone();
+            dec.copy_from_slice(&section);
             aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
             if let Some(cnmt) = parse_cnmt_from_section_bytes(&dec) {
                 return Some(cnmt);
@@ -994,13 +998,26 @@ fn pfs0_candidate_offsets(section: &[u8]) -> Vec<usize> {
     if scan_len >= 4 {
         for i in 0..=(scan_len - 4) {
             if &section[i..i + 4] == b"PFS0" {
-                out.push(i);
+                if i != 0 {
+                    out.push(i);
+                }
             }
         }
     }
-    out.sort_unstable();
-    out.dedup();
     out
+}
+
+fn get_or_open_reader<'a>(
+    readers: &'a mut HashMap<String, BufReader<File>>,
+    source_path: &str,
+) -> Result<&'a mut BufReader<File>> {
+    match readers.entry(source_path.to_string()) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let file = File::open(source_path)?;
+            Ok(entry.insert(BufReader::new(file)))
+        }
+    }
 }
 
 fn build_xci_output(
@@ -1014,8 +1031,9 @@ fn build_xci_output(
     use crate::formats::xci::{XciBuilder, XCI_PREFIX_SIZE};
 
     let mut enc_title_keys_by_rights: HashMap<[u8; 16], [u8; 16]> = HashMap::new();
+    let mut source_readers: HashMap<String, BufReader<File>> = HashMap::new();
     for tik in tickets {
-        let mut src = BufReader::new(File::open(&tik.source_path)?);
+        let src = get_or_open_reader(&mut source_readers, &tik.source_path)?;
         src.seek(SeekFrom::Start(tik.abs_offset))?;
         let mut raw = vec![0u8; tik.size as usize];
         src.read_exact(&mut raw)?;
@@ -1037,7 +1055,7 @@ fn build_xci_output(
     // Build secure partition HFS0
     let mut secure_builder = Hfs0Builder::new();
     for nca in ncas {
-        let mut src = BufReader::new(File::open(&nca.source_path)?);
+        let src = get_or_open_reader(&mut source_readers, &nca.source_path)?;
         src.seek(SeekFrom::Start(nca.abs_offset))?;
         let mut enc_header = vec![0u8; 0xC00];
         src.read_exact(&mut enc_header)?;
@@ -1150,9 +1168,9 @@ fn build_xci_output(
         out.write_all(&nca.patched_header)?;
         pb.inc(nca.patched_header.len() as u64);
         if nca.size > nca.patched_header.len() as u64 {
-            let mut src = BufReader::new(File::open(&nca.source_path)?);
+            let src = get_or_open_reader(&mut source_readers, &nca.source_path)?;
             uio::copy_section(
-                &mut src,
+                src,
                 &mut out,
                 nca.abs_offset + nca.patched_header.len() as u64,
                 nca.size - nca.patched_header.len() as u64,
