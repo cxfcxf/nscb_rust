@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -90,36 +90,38 @@ fn collect_top_level_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-fn build_pack_order(mut files: Vec<PathBuf>, ks: &KeyStore) -> Vec<PathBuf> {
-    files.sort_by_key(|p| {
-        p.file_name()
-            .map(|n| n.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default()
-    });
+fn build_pack_order(files: Vec<PathBuf>, ks: &KeyStore) -> Vec<PathBuf> {
+    let mut files: Vec<(PathBuf, String, u64)> = files
+        .into_iter()
+        .map(|p| {
+            let lower = lower_name(&p);
+            let size = p.metadata().map(|m| m.len()).unwrap_or(0);
+            (p, lower, size)
+        })
+        .collect();
+    files.sort_by(|a, b| a.1.cmp(&b.1));
 
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
 
     // 1) CNMT-driven NCA order (matches python ncalist_bycnmt behavior).
-    let mut id_to_file: Vec<(String, PathBuf)> = Vec::new();
-    for p in &files {
-        let name = lower_name(p);
+    let mut id_to_file: HashMap<String, PathBuf> = HashMap::new();
+    for (p, name, _) in &files {
         if name.ends_with(".nca") {
             if let Some(stem) = name.strip_suffix(".nca") {
-                id_to_file.push((stem.to_string(), p.clone()));
+                id_to_file.entry(stem.to_string()).or_insert_with(|| p.clone());
             }
         } else if name.ends_with(".ncz") {
             if let Some(stem) = name.strip_suffix(".ncz") {
-                id_to_file.push((stem.to_string(), p.clone()));
+                id_to_file.entry(stem.to_string()).or_insert_with(|| p.clone());
             }
         }
     }
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name, _) in &files {
         if name.ends_with(".cnmt.nca") {
             if let Some(cnmt) = parse_cnmt_from_meta_nca_file(p, ks) {
                 for nca_id in cnmt.nca_ids() {
-                    if let Some((_, fp)) = id_to_file.iter().find(|(id, _)| id == &nca_id) {
+                    if let Some(fp) = id_to_file.get(&nca_id) {
                         push_unique(&mut out, &mut seen, fp.clone());
                     }
                 }
@@ -129,52 +131,45 @@ fn build_pack_order(mut files: Vec<PathBuf>, ks: &KeyStore) -> Vec<PathBuf> {
     // Fallback when CNMT parsing fails: place non-meta NCAs first (largest-first),
     // then meta NCA, mirroring python create behavior on these split folders.
     if out.is_empty() {
-        let mut non_meta: Vec<(u64, PathBuf)> = files
+        let mut non_meta: Vec<(u64, String, PathBuf)> = files
             .iter()
-            .filter(|p| {
-                let n = lower_name(p);
-                n.ends_with(".nca") && !n.ends_with(".cnmt.nca")
-            })
-            .map(|p| (p.metadata().map(|m| m.len()).unwrap_or(0), p.clone()))
+            .filter(|(_, n, _)| n.ends_with(".nca") && !n.ends_with(".cnmt.nca"))
+            .map(|(p, n, size)| (*size, n.clone(), p.clone()))
             .collect();
         non_meta.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| lower_name(&a.1).cmp(&lower_name(&b.1)))
+                .then_with(|| a.1.cmp(&b.1))
         });
-        for (_, p) in non_meta {
+        for (_, _, p) in non_meta {
             push_unique(&mut out, &mut seen, p);
         }
     }
     // 2) Meta NCA(s)
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name, _) in &files {
         if name.ends_with(".cnmt.nca") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 3) .cnmt xml/plain
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name, _) in &files {
         if name.ends_with(".cnmt") || name.ends_with(".cnmt.xml") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 4) Images
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name, _) in &files {
         if name.ends_with(".jpg") || name.ends_with(".jpeg") || name.ends_with(".png") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 5) Tickets/certs
-    for p in &files {
-        let name = lower_name(p);
+    for (p, name, _) in &files {
         if name.ends_with(".tik") || name.ends_with(".cert") {
             push_unique(&mut out, &mut seen, p.clone());
         }
     }
     // 6) Anything else
-    for p in files {
+    for (p, _, _) in files {
         push_unique(&mut out, &mut seen, p);
     }
 
@@ -252,8 +247,9 @@ fn parse_cnmt_from_meta_nca_file(path: &Path, ks: &KeyStore) -> Option<Cnmt> {
             return Some(cnmt);
         }
         let nonce = header.section_ctr_nonce(sec_idx);
+        let mut dec = vec![0u8; section.len()];
         for key in &keys {
-            let mut dec = section.clone();
+            dec.copy_from_slice(&section);
             aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
             if let Some(cnmt) = parse_cnmt_from_section_bytes(&dec) {
                 return Some(cnmt);
