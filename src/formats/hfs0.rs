@@ -220,9 +220,10 @@ impl Hfs0Builder {
     /// total header size is aligned to `alignment`.
     pub fn build_header_aligned(&self, alignment: u64) -> Vec<u8> {
         let file_count = self.files.len() as u32;
+        let string_table_capacity: usize = self.files.iter().map(|f| f.name.len() + 1).sum();
 
-        let mut string_table = Vec::new();
-        let mut name_offsets = Vec::new();
+        let mut string_table = Vec::with_capacity(string_table_capacity);
+        let mut name_offsets = Vec::with_capacity(self.files.len());
         for f in &self.files {
             name_offsets.push(string_table.len() as u32);
             string_table.extend_from_slice(f.name.as_bytes());
@@ -243,7 +244,8 @@ impl Hfs0Builder {
 
         let string_table_size = string_table.len() as u32;
 
-        let mut header = Vec::new();
+        let mut header =
+            Vec::with_capacity(0x10 + self.files.len() * ENTRY_SIZE as usize + string_table.len());
         header.extend_from_slice(HFS0_MAGIC);
         header.extend_from_slice(&file_count.to_le_bytes());
         header.extend_from_slice(&string_table_size.to_le_bytes());
