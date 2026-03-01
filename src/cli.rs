@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::error::Result;
 use crate::formats::nsp::Nsp;
@@ -86,11 +87,10 @@ pub fn dispatch(args: Args) -> Result<()> {
                 "No valid input files after filtering metadata sidecar entries".to_string(),
             ));
         }
-        let file_refs: Vec<&str> = filtered_files.clone();
-        let merge_name = build_merge_filename_metadata(&file_refs, &args.output_type, &ks)
-            .unwrap_or_else(|| build_merge_filename(&file_refs, &args.output_type));
+        let merge_name = build_merge_filename_metadata(&filtered_files, &args.output_type, &ks)
+            .unwrap_or_else(|| build_merge_filename(&filtered_files, &args.output_type));
         let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp")
-            && file_refs.iter().any(|p| {
+            && filtered_files.iter().any(|p| {
                 let lower = p.to_ascii_lowercase();
                 lower.ends_with(".xci") || lower.ends_with(".xcz")
             });
@@ -100,7 +100,7 @@ pub fn dispatch(args: Args) -> Result<()> {
             &merge_name,
         );
         return crate::ops::merge::merge(
-            &file_refs,
+            &filtered_files,
             &output,
             &ks,
             args.nodelta,
@@ -171,14 +171,8 @@ fn sanitize_output_filename(name: &str) -> String {
     };
     let mut out = stem;
     // Mirror squirrel.py cleanup used for generated output names.
-    out = Regex::new(r"[\/\\:\*\?]+")
-        .unwrap()
-        .replace_all(&out, "")
-        .to_string();
-    out = Regex::new(r#"[™©®`~\^´ªº¢#£€¥$ƒ±¬½¼♡«»•²‰œæÆ³☆<>|]"#)
-        .unwrap()
-        .replace_all(&out, "")
-        .to_string();
+    out = sanitize_forbidden_chars_re().replace_all(&out, "").to_string();
+    out = sanitize_symbol_chars_re().replace_all(&out, "").to_string();
 
     let translits = [
         ("Ⅰ", "I"),
@@ -252,10 +246,7 @@ fn sanitize_output_filename(name: &str) -> String {
         out = out.replace(from, to);
     }
 
-    out = Regex::new(r" {3,}")
-        .unwrap()
-        .replace_all(&out, " ")
-        .to_string();
+    out = sanitize_multispace_re().replace_all(&out, " ").to_string();
     out = out.replace("( ", "(");
     out = out.replace(" )", ")");
     out = out.replace("[ ", "[");
@@ -287,6 +278,24 @@ fn sanitize_output_filename(name: &str) -> String {
     } else {
         format!("{}{}", out, ext)
     }
+}
+
+fn sanitize_forbidden_chars_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[\/\\:\*\?]+").expect("valid forbidden-char regex"))
+}
+
+fn sanitize_symbol_chars_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"[™©®`~\^´ªº¢#£€¥$ƒ±¬½¼♡«»•²‰œæÆ³☆<>|]"#)
+            .expect("valid symbol-char regex")
+    })
+}
+
+fn sanitize_multispace_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r" {3,}").expect("valid multispace regex"))
 }
 
 fn change_ext(path: &str, new_ext: &str) -> String {
