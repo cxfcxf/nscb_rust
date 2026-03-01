@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -101,16 +101,20 @@ fn build_pack_order(mut files: Vec<PathBuf>, ks: &KeyStore) -> Vec<PathBuf> {
     let mut seen: HashSet<String> = HashSet::new();
 
     // 1) CNMT-driven NCA order (matches python ncalist_bycnmt behavior).
-    let mut id_to_file: Vec<(String, PathBuf)> = Vec::new();
+    let mut id_to_file: HashMap<String, PathBuf> = HashMap::new();
     for p in &files {
         let name = lower_name(p);
         if name.ends_with(".nca") {
             if let Some(stem) = name.strip_suffix(".nca") {
-                id_to_file.push((stem.to_string(), p.clone()));
+                id_to_file
+                    .entry(stem.to_string())
+                    .or_insert_with(|| p.clone());
             }
         } else if name.ends_with(".ncz") {
             if let Some(stem) = name.strip_suffix(".ncz") {
-                id_to_file.push((stem.to_string(), p.clone()));
+                id_to_file
+                    .entry(stem.to_string())
+                    .or_insert_with(|| p.clone());
             }
         }
     }
@@ -119,7 +123,7 @@ fn build_pack_order(mut files: Vec<PathBuf>, ks: &KeyStore) -> Vec<PathBuf> {
         if name.ends_with(".cnmt.nca") {
             if let Some(cnmt) = parse_cnmt_from_meta_nca_file(p, ks) {
                 for nca_id in cnmt.nca_ids() {
-                    if let Some((_, fp)) = id_to_file.iter().find(|(id, _)| id == &nca_id) {
+                    if let Some(fp) = id_to_file.get(&nca_id) {
                         push_unique(&mut out, &mut seen, fp.clone());
                     }
                 }
