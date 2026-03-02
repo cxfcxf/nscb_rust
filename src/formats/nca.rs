@@ -67,6 +67,14 @@ pub struct NcaHeader {
 }
 
 impl NcaHeader {
+    fn has_valid_magic(data: &[u8]) -> bool {
+        if data.len() < 0x204 {
+            return false;
+        }
+
+        matches!(&data[0x200..0x204], b"NCA3" | b"NCA2")
+    }
+
     /// Parse an NCA header by decrypting the first 0xC00 bytes with XTS.
     pub fn from_reader<R: Read + Seek>(reader: &mut R, offset: u64, ks: &KeyStore) -> Result<Self> {
         reader.seek(SeekFrom::Start(offset))?;
@@ -103,6 +111,13 @@ impl NcaHeader {
             let xts = NintendoXts::new(&key)?;
             let mut decrypted = encrypted[..0xC00].to_vec();
             xts.decrypt_with_endian(0, &mut decrypted, le_sector);
+            if !Self::has_valid_magic(&decrypted) {
+                last_err = Some(NscbError::InvalidMagic {
+                    expected: "NCA3/NCA2".into(),
+                    got: String::from_utf8_lossy(&decrypted[0x200..0x204]).into(),
+                });
+                continue;
+            }
             match Self::from_decrypted(decrypted) {
                 Ok(header) => return Ok(header),
                 Err(e) => last_err = Some(e),
@@ -310,7 +325,7 @@ fn decrypt_header_for_edit(encrypted: &[u8], ks: &KeyStore) -> Result<(Vec<u8>, 
         let xts = NintendoXts::new(&key)?;
         let mut decrypted = encrypted[..0xC00].to_vec();
         xts.decrypt_with_endian(0, &mut decrypted, le_sector);
-        if NcaHeader::from_decrypted(decrypted.clone()).is_ok() {
+        if NcaHeader::has_valid_magic(&decrypted) {
             return Ok((decrypted, key, le_sector));
         }
     }
@@ -448,9 +463,11 @@ mod tests {
         let mut header_data = vec![0u8; 0xC00];
         header_data[0x200..0x204].copy_from_slice(b"NCA3");
 
-        let header = NcaHeader::from_decrypted(header_data.clone()).unwrap();
+        let header = NcaHeader::from_decrypted(header_data).unwrap();
         assert!(!header.has_rights_id());
 
+        let mut header_data = vec![0u8; 0xC00];
+        header_data[0x200..0x204].copy_from_slice(b"NCA3");
         header_data[0x230] = 0x01;
         let header2 = NcaHeader::from_decrypted(header_data).unwrap();
         assert!(header2.has_rights_id());
