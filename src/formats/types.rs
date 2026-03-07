@@ -196,3 +196,62 @@ pub fn rsv_to_firmware(rsv: u32) -> &'static str {
         .map(|(_, fw)| *fw)
         .unwrap_or("Unknown")
 }
+
+pub fn get_top_rsv(keygeneration: u8, rsv: u32) -> u32 {
+    match keygeneration {
+        0 => 450,
+        1 => 262_164,
+        2 => 201_327_002,
+        3 => 201_457_684,
+        4 => 269_484_082,
+        5 => 336_592_976,
+        6 => 403_701_850,
+        7 => 404_750_376,
+        8 => 536_936_448,
+        9 => 537_919_488,
+        10 => 603_979_776,
+        11 => 605_028_352,
+        12 => 806_354_944,
+        13 => 872_415_232,
+        _ => rsv,
+    }
+}
+
+pub fn get_min_rsv(keygeneration: u8, rsv: u32) -> u32 {
+    match keygeneration {
+        0 => 0,
+        1 => 65_796,
+        2 => 3 * 67_108_864,
+        3 => 3 * 67_108_864 + 65_536,
+        4 => 4 * 67_108_864,
+        5 => 5 * 67_108_864,
+        6 => 6 * 67_108_864,
+        7 => 6 * 67_108_864 + 2 * 1_048_576,
+        8 => 7 * 67_108_864,
+        9 => 8 * 67_108_864 + 1 * 1_048_576,
+        10 => 9 * 67_108_864,
+        11 => 9 * 67_108_864 + 2 * 1_048_576,
+        12 => 12 * 67_108_864 + 1 * 1_048_576,
+        _ => rsv,
+    }
+}
+
+pub fn apply_patcher_meta_rsv(keygeneration: u8, current_rsv: u32, requested_rsv_cap: u32) -> u32 {
+    let rsv_min = get_min_rsv(keygeneration, current_rsv);
+    let rsv_max = get_top_rsv(keygeneration, current_rsv);
+    if current_rsv > rsv_min {
+        if rsv_min >= requested_rsv_cap {
+            rsv_min
+        } else if keygeneration < 4 {
+            if current_rsv > rsv_max {
+                requested_rsv_cap
+            } else {
+                current_rsv
+            }
+        } else {
+            requested_rsv_cap
+        }
+    } else {
+        current_rsv
+    }
+}

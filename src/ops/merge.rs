@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::Command;
 
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
@@ -39,6 +38,8 @@ struct MergeEntry {
     is_delta: bool,
     /// Source came from NSP/NSZ-like container.
     source_is_nsp_like: bool,
+    /// Source container was originally compressed (NSZ/XCZ), matching squirrel.py NCZ path quirks.
+    source_was_compressed: bool,
 }
 
 /// A ticket to include in the output.
@@ -70,6 +71,30 @@ struct XmlEntry {
     source_is_nsp_like: bool,
 }
 
+#[derive(Debug)]
+struct EffectiveInput {
+    path: String,
+    source_was_compressed: bool,
+    container_hint: ContainerHint,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ContainerHint {
+    NspLike,
+    XciLike,
+}
+
+fn effective_direct_multi_rsv_cap(rsvcap: Option<u32>, keypatch: Option<u8>) -> Option<u32> {
+    let mut effective = rsvcap?;
+    if let Some(new_keygen) = keypatch {
+        let min_rsv = crate::formats::types::get_min_rsv(new_keygen, effective);
+        if min_rsv > effective {
+            effective = min_rsv;
+        }
+    }
+    Some(effective)
+}
+
 /// Merge multiple NSP/XCI files into one NSP.
 pub fn merge(
     input_paths: &[&str],
@@ -93,7 +118,7 @@ pub fn merge(
 
     // Auto-decompress NSZ/XCZ inputs to temp files first
     let mut temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
-    let mut effective_paths: Vec<String> = Vec::new();
+    let mut effective_inputs: Vec<EffectiveInput> = Vec::new();
 
     for path_str in input_paths {
         let path = Path::new(path_str);
@@ -113,16 +138,33 @@ pub fn merge(
                 let tmp = tempfile::NamedTempFile::new()?;
                 let tmp_path = tmp.path().to_string_lossy().to_string();
                 crate::ops::decompress::decompress(path_str, &tmp_path)?;
-                effective_paths.push(tmp_path);
+                effective_inputs.push(EffectiveInput {
+                    path: tmp_path,
+                    source_was_compressed: true,
+                    container_hint: if ext == "xcz" {
+                        ContainerHint::XciLike
+                    } else {
+                        ContainerHint::NspLike
+                    },
+                });
                 temp_files.push(tmp);
             }
             _ => {
-                effective_paths.push(path_str.to_string());
+                effective_inputs.push(EffectiveInput {
+                    path: path_str.to_string(),
+                    source_was_compressed: false,
+                    container_hint: match ext.as_str() {
+                        "xci" => ContainerHint::XciLike,
+                        _ => ContainerHint::NspLike,
+                    },
+                });
             }
         }
     }
 
-    for path_str in &effective_paths {
+    for input in &effective_inputs {
+        let path_str = input.path.as_str();
+        let source_was_compressed = input.source_was_compressed;
         let path = Path::new(path_str);
         let ext = path
             .extension()
@@ -130,8 +172,8 @@ pub fn merge(
             .unwrap_or("")
             .to_lowercase();
 
-        match ext.as_str() {
-            "nsp" => {
+        match (ext.as_str(), input.container_hint) {
+            ("nsp", _) | ("", ContainerHint::NspLike) => {
                 collect_from_nsp(
                     path_str,
                     ks,
@@ -142,10 +184,12 @@ pub fn merge(
                     &mut seen_nca_ids,
                     &mut seen_xml_names,
                     rsvcap,
+                    keypatch,
+                    source_was_compressed,
                     print_version,
                 )?;
             }
-            "xci" => {
+            ("xci", _) | ("", ContainerHint::XciLike) => {
                 collect_from_xci(
                     path_str,
                     ks,
@@ -155,32 +199,16 @@ pub fn merge(
                     &mut seen_nca_ids,
                     &mut seen_xml_names,
                     rsvcap,
+                    keypatch,
+                    source_was_compressed,
                     print_version,
                 )?;
             }
             _ => {
-                // Temp files from decompression don't have .nsp extension
-                // Try as NSP first
-                match collect_from_nsp(
-                    path_str,
-                    ks,
-                    &mut all_ncas,
-                    &mut all_tickets,
-                    &mut all_certs,
-                    &mut all_xmls,
-                    &mut seen_nca_ids,
-                    &mut seen_xml_names,
-                    rsvcap,
-                    print_version,
-                ) {
-                    Ok(()) => {}
-                    Err(_) => {
-                        return Err(NscbError::UnsupportedFormat(format!(
-                            "Unknown input format: {}",
-                            ext
-                        )));
-                    }
-                }
+                return Err(NscbError::UnsupportedFormat(format!(
+                    "Unknown input format: {}",
+                    ext
+                )));
             }
         }
     }
@@ -208,6 +236,7 @@ pub fn merge(
             &all_ncas,
             &all_tickets,
             ks,
+            rsvcap,
             keypatch,
             print_version,
         )?,
@@ -219,6 +248,7 @@ pub fn merge(
             &all_xmls,
             nsp_direct_multi_python_mode,
             ks,
+            rsvcap,
             keypatch,
             print_version,
         )?,
@@ -238,6 +268,8 @@ fn collect_from_nsp(
     seen: &mut HashMap<String, usize>,
     seen_xml: &mut HashSet<String>,
     rsvcap: Option<u32>,
+    keypatch: Option<u8>,
+    source_was_compressed: bool,
     print_version: bool,
 ) -> Result<()> {
     let mut file = BufReader::new(File::open(path)?);
@@ -257,7 +289,6 @@ fn collect_from_nsp(
         let meta_abs = nsp.file_abs_offset(meta);
         maybe_add_generated_xml(
             &mut file,
-            path,
             meta.name.clone(),
             meta_abs,
             meta.size,
@@ -266,6 +297,7 @@ fn collect_from_nsp(
             xmls,
             seen_xml,
             rsvcap,
+            keypatch,
             print_version,
         )?;
         if let Some(cnmt) = parse_cnmt_from_meta_nca_at(&mut file, meta_abs, ks) {
@@ -282,6 +314,7 @@ fn collect_from_nsp(
                         &mut file,
                         ks,
                         true,
+                        source_was_compressed,
                     );
                 }
             }
@@ -295,6 +328,7 @@ fn collect_from_nsp(
                 &mut file,
                 ks,
                 true,
+                source_was_compressed,
             );
         } else {
             push_nca_if_new(
@@ -307,6 +341,7 @@ fn collect_from_nsp(
                 &mut file,
                 ks,
                 true,
+                source_was_compressed,
             );
         }
     }
@@ -323,6 +358,7 @@ fn collect_from_nsp(
             &mut file,
             ks,
             true,
+            source_was_compressed,
         );
     }
 
@@ -358,6 +394,8 @@ fn collect_from_xci(
     seen: &mut HashMap<String, usize>,
     seen_xml: &mut HashSet<String>,
     rsvcap: Option<u32>,
+    keypatch: Option<u8>,
+    source_was_compressed: bool,
     print_version: bool,
 ) -> Result<()> {
     let mut file = BufReader::new(File::open(path)?);
@@ -392,12 +430,12 @@ fn collect_from_xci(
             content_type,
             is_delta: false,
             source_is_nsp_like: false,
+            source_was_compressed,
         });
 
         if entry.name.ends_with(".cnmt.nca") {
             maybe_add_generated_xml(
                 &mut file,
-                path,
                 entry.name.clone(),
                 entry.abs_offset,
                 entry.size,
@@ -406,6 +444,7 @@ fn collect_from_xci(
                 xmls,
                 seen_xml,
                 rsvcap,
+                keypatch,
                 print_version,
             )?;
         }
@@ -422,9 +461,11 @@ fn build_nsp_output(
     xmls: &[XmlEntry],
     python_direct_multi_mode: bool,
     ks: &KeyStore,
+    rsvcap: Option<u32>,
     keypatch: Option<u8>,
     print_version: bool,
 ) -> Result<()> {
+    let effective_rsvcap = effective_direct_multi_rsv_cap(rsvcap, keypatch);
     let mut nsp_backing_by_name: HashMap<String, &MergeEntry> = HashMap::new();
     if python_direct_multi_mode {
         for nca in ncas {
@@ -522,32 +563,49 @@ fn build_nsp_output(
                 };
                 if let Some(entry) = to_write {
                     let mut src = BufReader::new(File::open(&entry.source_path)?);
-                    if let Some(new_keygen) = keypatch {
+                    if effective_rsvcap.is_some() || keypatch.is_some() {
                         src.seek(SeekFrom::Start(entry.abs_offset))?;
-                        let mut enc_header = vec![0u8; 0xC00];
-                        src.read_exact(&mut enc_header)?;
-                        let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
-                        let patched_header =
-                            crate::formats::nca::rewrite_header_with_keygen(&enc_header, ks, new_keygen, false)?;
-                        if print_version {
-                            println!(
-                                "NCA {} keygen {} -> {}",
-                                entry.nca_name,
-                                parsed.key_generation(),
-                                parsed.key_generation().min(new_keygen)
-                            );
+                        let mut nca_bytes = vec![0u8; entry.size as usize];
+                        src.read_exact(&mut nca_bytes)?;
+                        if let Some(cap) = effective_rsvcap {
+                            if entry.nca_name.ends_with(".cnmt.nca") {
+                                if let Some((patched, before, after)) =
+                                    crate::formats::nca::patch_meta_nca_with_rsvcap(
+                                        &nca_bytes,
+                                        ks,
+                                        cap,
+                                        keypatch,
+                                    )?
+                                {
+                                    if print_version {
+                                        println!("CNMT {} RSV {} -> {}", entry.nca_name, before, after);
+                                    }
+                                    nca_bytes = patched;
+                                }
+                            }
                         }
-                        out.write_all(&patched_header)?;
-                        pb.inc(patched_header.len() as u64);
-                        if entry.size > patched_header.len() as u64 {
-                            uio::copy_section(
-                                &mut src,
-                                &mut out,
-                                entry.abs_offset + patched_header.len() as u64,
-                                entry.size - patched_header.len() as u64,
-                                Some(&pb),
-                            )?;
+                        if let Some(new_keygen) = keypatch {
+                            let parsed = NcaHeader::from_encrypted(&nca_bytes[..0xC00], ks)?;
+                            if new_keygen < parsed.crypto_type2 {
+                                let patched_header = crate::formats::nca::rewrite_header_with_keygen(
+                                    &nca_bytes[..0xC00],
+                                    ks,
+                                    new_keygen,
+                                    false,
+                                )?;
+                                if print_version {
+                                    println!(
+                                        "NCA {} keygen {} -> {}",
+                                        entry.nca_name,
+                                        parsed.crypto_type2,
+                                        new_keygen
+                                    );
+                                }
+                                nca_bytes[..0xC00].copy_from_slice(&patched_header);
+                            }
                         }
+                        out.write_all(&nca_bytes)?;
+                        pb.inc(nca_bytes.len() as u64);
                     } else {
                         uio::copy_section(&mut src, &mut out, entry.abs_offset, entry.size, Some(&pb))?;
                     }
@@ -591,6 +649,7 @@ fn push_nca_if_new(
     file: &mut BufReader<File>,
     ks: &KeyStore,
     source_is_nsp_like: bool,
+    source_was_compressed: bool,
 ) {
     let nca_id = name
         .trim_end_matches(".nca")
@@ -613,12 +672,12 @@ fn push_nca_if_new(
         content_type,
         is_delta: false,
         source_is_nsp_like,
+        source_was_compressed,
     });
 }
 
 fn maybe_add_generated_xml(
     file: &mut BufReader<File>,
-    source_path: &str,
     meta_name: String,
     abs_offset: u64,
     size: u64,
@@ -627,50 +686,11 @@ fn maybe_add_generated_xml(
     xmls: &mut Vec<XmlEntry>,
     seen_xml: &mut HashSet<String>,
     rsvcap: Option<u32>,
-    print_version: bool,
+    keypatch: Option<u8>,
+    _print_version: bool,
 ) -> Result<()> {
     if !meta_name.ends_with(".cnmt.nca") {
         return Ok(());
-    }
-    if rsvcap.is_none() {
-        if let Some(py_xml) = generate_xml_via_python_container(source_path, &meta_name)? {
-            let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
-            if seen_xml.insert(xml_name.to_ascii_lowercase()) {
-                xmls.push(XmlEntry {
-                    source_path: if source_is_nsp_like {
-                        Some(source_path.to_string())
-                    } else {
-                        None
-                    },
-                    name: xml_name,
-                    abs_offset: None,
-                    size: py_xml.len() as u64,
-                    inline_data: Some(py_xml),
-                    source_is_nsp_like,
-                });
-            }
-            return Ok(());
-        }
-    }
-    if rsvcap.is_none() {
-        if let Some(py_xml) = generate_xml_via_python(file, abs_offset, size, &meta_name)? {
-            let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
-            if seen_xml.insert(xml_name.to_ascii_lowercase()) {
-                xmls.push(XmlEntry {
-                    source_path: if source_is_nsp_like {
-                        Some(source_path.to_string())
-                    } else {
-                        None
-                    },
-                    name: xml_name,
-                    abs_offset: None,
-                    size: py_xml.len() as u64,
-                    inline_data: Some(py_xml),
-                    source_is_nsp_like,
-                });
-            }
-            return Ok(());
-        }
     }
     let Some((cnmt, digest, crypto2, keygen, nsha)) = parse_meta_xml_info(file, abs_offset, size, ks)? else {
         return Ok(());
@@ -680,23 +700,15 @@ fn maybe_add_generated_xml(
         return Ok(());
     }
     let mut cnmt = cnmt;
-    if let Some(cap) = rsvcap {
+    if let Some(cap) = effective_direct_multi_rsv_cap(rsvcap, keypatch) {
         let before = cnmt.required_system_version;
-        cnmt.patch_required_system_version(cap);
-        if print_version {
-            println!(
-                "CNMT {} RSV {} -> {}",
-                meta_name, before, cnmt.required_system_version
-            );
-        }
+        let keygen_u8 = keypatch.unwrap_or(keygen);
+        let after = crate::formats::types::apply_patcher_meta_rsv(keygen_u8, before, cap);
+        cnmt.patch_required_system_version(after);
     }
     let xml = build_python_cnmt_xml(&meta_name, size, &cnmt, &digest, crypto2, keygen, &nsha);
     xmls.push(XmlEntry {
-        source_path: if source_is_nsp_like {
-            Some(source_path.to_string())
-        } else {
-            None
-        },
+        source_path: None,
         name: xml_name,
         abs_offset: None,
         size: xml.len() as u64,
@@ -704,143 +716,6 @@ fn maybe_add_generated_xml(
         source_is_nsp_like,
     });
     Ok(())
-}
-
-fn generate_xml_via_python_container(source_path: &str, meta_name: &str) -> Result<Option<Vec<u8>>> {
-    let ztools = default_python_ztools();
-    if !Path::new(&ztools).is_dir() {
-        return Ok(None);
-    }
-    let python_bin = default_python_bin();
-    let outdir = tempfile::tempdir()?;
-    let out_path = outdir.path().to_string_lossy().to_string();
-    let py = r#"
-import os, sys
-ztools = sys.argv[1]
-container = sys.argv[2]
-outd = sys.argv[3]
-meta_name = sys.argv[4]
-os.chdir(ztools)
-sys.path.insert(0, ztools)
-sys.path.insert(0, os.path.join(ztools, 'lib'))
-import sq_settings
-sq_settings.set_prod_environment()
-import Fs
-cl = container.lower()
-if cl.endswith('.xci') or cl.endswith('.xcz'):
-    f = Fs.Xci(container)
-else:
-    f = Fs.Nsp(container)
-_ = f.get_content(outd, False, True)
-xmlp = os.path.join(outd, meta_name[:-3] + 'xml')
-if os.path.exists(xmlp):
-    print(xmlp)
-"#;
-    let out = Command::new(&python_bin)
-        .arg("-c")
-        .arg(py)
-        .arg(&ztools)
-        .arg(source_path)
-        .arg(&out_path)
-        .arg(meta_name)
-        .output();
-    let Ok(out) = out else {
-        return Ok(None);
-    };
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let xml_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if xml_path.is_empty() || !Path::new(&xml_path).is_file() {
-        return Ok(None);
-    }
-    Ok(Some(std::fs::read(xml_path)?))
-}
-
-fn generate_xml_via_python(
-    file: &mut BufReader<File>,
-    abs_offset: u64,
-    size: u64,
-    meta_name: &str,
-) -> Result<Option<Vec<u8>>> {
-    let ztools = default_python_ztools();
-    if !Path::new(&ztools).is_dir() {
-        return Ok(None);
-    }
-    let python_bin = default_python_bin();
-
-    let outdir = tempfile::tempdir()?;
-    let out_path = outdir.path().to_string_lossy().to_string();
-    let nca_path = outdir.path().join(meta_name);
-    let mut nca_file = File::create(&nca_path)?;
-    file.seek(SeekFrom::Start(abs_offset))?;
-    std::io::copy(&mut file.by_ref().take(size), &mut nca_file)?;
-    let nca_path_s = nca_path.to_string_lossy().to_string();
-    let py = r#"
-import hashlib, os, sys
-ztools = sys.argv[1]
-nca = sys.argv[2]
-outd = sys.argv[3]
-meta_name = sys.argv[4]
-os.chdir(ztools)
-sys.path.insert(0, ztools)
-sys.path.insert(0, os.path.join(ztools, 'lib'))
-import sq_settings
-sq_settings.set_prod_environment()
-import Fs
-nca_plain = os.path.join(outd, meta_name)
-src = Fs.Nca(nca, 'r+b')
-src.rewind()
-with open(nca_plain, 'w+b') as fp:
-    while True:
-        data = src.read(32768)
-        if not data:
-            break
-        fp.write(data)
-        fp.flush()
-f = Fs.Nca(nca_plain, 'r+b')
-f.rewind()
-b = f.read()
-nsha = hashlib.sha256(b).hexdigest()
-f.rewind()
-xml = f.xml_gen(outd, nsha)
-print(xml)
-"#;
-    let out = Command::new(&python_bin)
-        .arg("-c")
-        .arg(py)
-        .arg(&ztools)
-        .arg(&nca_path_s)
-        .arg(&out_path)
-        .arg(meta_name)
-        .output();
-    let Ok(out) = out else {
-        return Ok(None);
-    };
-    if !out.status.success() {
-        return Ok(None);
-    }
-    let xml_path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if xml_path.is_empty() || !Path::new(&xml_path).is_file() {
-        return Ok(None);
-    }
-    let bytes = std::fs::read(xml_path)?;
-    Ok(Some(bytes))
-}
-
-fn default_python_ztools() -> String {
-    std::env::var("NSCB_PY_ZTOOLS").unwrap_or_else(|_| ".qa_suite/reference/NSC_BUILDER/py/ztools".to_string())
-}
-
-fn default_python_bin() -> String {
-    std::env::var("NSCB_PYTHON").unwrap_or_else(|_| {
-        let venv = ".qa_suite/reference/NSC_BUILDER/.venv/bin/python";
-        if Path::new(venv).is_file() {
-            venv.to_string()
-        } else {
-            "python".to_string()
-        }
-    })
 }
 
 fn parse_meta_xml_info(
@@ -852,12 +727,17 @@ fn parse_meta_xml_info(
     let mut nca_bytes = vec![0u8; nca_size as usize];
     file.seek(SeekFrom::Start(abs_offset))?;
     file.read_exact(&mut nca_bytes)?;
-    let nsha = hex::encode(crate::crypto::hash::sha256(&nca_bytes));
 
     let header = NcaHeader::from_encrypted(&nca_bytes[..0xC00], ks)?;
     let keys = header.decrypt_key_area(ks)?;
     let crypto2 = header.crypto_type2;
-    let keygen = header.crypto_type.max(header.crypto_type2);
+    let keygen = header.python_patcher_key_generation();
+    // Match squirrel.py's direct-multi xml path, which hashes from the NCA stream cursor
+    // after the embedded PFS0 is opened. For meta NCAs this lands at `pfs0_abs + 0x30`.
+    let nsha_start = (0xC00u64 + header.htable_offset() + header.pfs0_offset() + 0x30)
+        .min(nca_bytes.len() as u64) as usize;
+    let nsha = hex::encode(crate::crypto::hash::sha256(&nca_bytes[nsha_start..]));
+    let xml_digest = python_xml_digest(&nca_bytes, &header, &keys).unwrap_or([0u8; 32]);
 
     for sec_idx in 0..4 {
         let sec = &header.section_table[sec_idx];
@@ -871,6 +751,7 @@ fn parse_meta_xml_info(
         }
         let section = &nca_bytes[rel..end];
         if let Some((cnmt, digest)) = parse_cnmt_and_digest_from_section(section) {
+            let digest = if xml_digest != [0u8; 32] { xml_digest } else { digest };
             return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
         }
         let nonce = header.section_ctr_nonce(sec_idx);
@@ -878,16 +759,82 @@ fn parse_meta_xml_info(
             let mut dec = section.to_vec();
             aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
             if let Some((cnmt, digest)) = parse_cnmt_and_digest_from_section(&dec) {
+                let digest = if xml_digest != [0u8; 32] { xml_digest } else { digest };
                 return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
             }
         }
     }
 
     if let Some(cnmt) = parse_cnmt_from_meta_nca_at(file, abs_offset, ks) {
-        return Ok(Some((cnmt, [0u8; 32], crypto2, keygen, nsha)));
+        return Ok(Some((cnmt, xml_digest, crypto2, keygen, nsha)));
     }
 
     Ok(None)
+}
+
+fn python_xml_digest(
+    encrypted_nca: &[u8],
+    header: &NcaHeader,
+    section_keys: &[[u8; 16]; 4],
+) -> Option<[u8; 32]> {
+    let pfs0_abs = 0xC00u64
+        .checked_add(header.htable_offset())?
+        .checked_add(header.pfs0_offset())?;
+    let digest_abs = pfs0_abs.checked_add(header.pfs0_size())?.checked_sub(0x20)?;
+
+    for sec_idx in 0..4 {
+        let sec = &header.section_table[sec_idx];
+        if !sec.is_present() || sec.size() == 0 {
+            continue;
+        }
+        let sec_start = sec.start_offset();
+        let sec_end = sec.end_offset();
+        if !(sec_start <= digest_abs && digest_abs + 0x20 <= sec_end) {
+            continue;
+        }
+        let sec_start_usize = sec_start as usize;
+        let sec_end_usize = sec_end as usize;
+        if sec_end_usize > encrypted_nca.len() {
+            continue;
+        }
+        let rel = (digest_abs - sec_start) as usize;
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&encrypted_nca[sec_start_usize + rel..sec_start_usize + rel + 0x20]);
+        if header.section_crypto_type(sec_idx) != 0 {
+            let key = section_keys[2];
+            let counter = header.section_crypto_counter(sec_idx);
+            aes_ctr_transform_with_counter_in_place(&key, &counter, digest_abs, &mut digest);
+        }
+        return Some(digest);
+    }
+    None
+}
+
+fn aes_ctr_transform_with_counter_in_place(
+    key: &[u8; 16],
+    counter16: &[u8; 16],
+    file_offset: u64,
+    data: &mut [u8],
+) {
+    let Ok(cipher) = Aes128::new_from_slice(key) else {
+        return;
+    };
+    let mut cached_block_index = u64::MAX;
+    let mut cached_keystream = [0u8; 16];
+    for (i, byte) in data.iter_mut().enumerate() {
+        let abs = file_offset + i as u64;
+        let block_index = abs / 16;
+        let byte_in_block = (abs % 16) as usize;
+        if block_index != cached_block_index {
+            let mut ctr = *counter16;
+            ctr[8..].copy_from_slice(&block_index.to_be_bytes());
+            let mut block = aes::Block::from(ctr);
+            cipher.encrypt_block(&mut block);
+            cached_keystream.copy_from_slice(&block);
+            cached_block_index = block_index;
+        }
+        *byte ^= cached_keystream[byte_in_block];
+    }
 }
 
 fn parse_cnmt_and_digest_from_section(section: &[u8]) -> Option<(Cnmt, [u8; 32])> {
@@ -1083,9 +1030,11 @@ fn build_xci_output(
     ncas: &[MergeEntry],
     tickets: &[TicketEntry],
     ks: &KeyStore,
+    rsvcap: Option<u32>,
     keypatch: Option<u8>,
     print_version: bool,
 ) -> Result<()> {
+    let effective_rsvcap = effective_direct_multi_rsv_cap(rsvcap, keypatch);
     use crate::formats::hfs0::Hfs0Builder;
     use crate::formats::types;
     use crate::formats::xci::{XciBuilder, XCI_PREFIX_SIZE};
@@ -1110,6 +1059,30 @@ fn build_xci_output(
         patched_header: Vec<u8>,
     }
     let mut prepared = Vec::with_capacity(ncas.len());
+    let mut source_headers_by_path: HashMap<String, Vec<NcaHeader>> = HashMap::new();
+
+    for nca in ncas {
+        let mut src = BufReader::new(File::open(&nca.source_path)?);
+        src.seek(SeekFrom::Start(nca.abs_offset))?;
+        let mut enc_header = vec![0u8; 0xC00];
+        src.read_exact(&mut enc_header)?;
+        source_headers_by_path
+            .entry(nca.source_path.clone())
+            .or_default()
+            .push(NcaHeader::from_encrypted(&enc_header, ks)?);
+    }
+    let source_is_cartridge: HashMap<String, bool> = source_headers_by_path
+        .iter()
+        .map(|(path, headers)| {
+            let has_program = headers
+                .iter()
+                .any(|header| header.content_type_enum() == Some(crate::formats::types::ContentType::Program));
+            (
+                path.clone(),
+                has_program && crate::formats::nca::python_xci_is_cartridge(headers, ks),
+            )
+        })
+        .collect();
 
     // Build secure partition HFS0
     let mut secure_builder = Hfs0Builder::new();
@@ -1129,19 +1102,50 @@ fn build_xci_output(
         } else {
             None
         };
+        let gc_flag = crate::formats::nca::python_xci_gamecard_flag(
+            &parsed,
+            ks,
+            *source_is_cartridge.get(&nca.source_path).unwrap_or(&false),
+        );
+        let mut final_nca: Option<Vec<u8>> = None;
         let mut patched_header =
-            crate::formats::nca::rewrite_header_for_xci(&enc_header, ks, title_key)?;
-        if let Some(new_keygen) = keypatch {
-            patched_header =
-                crate::formats::nca::rewrite_header_with_keygen(&patched_header, ks, new_keygen, true)?;
-            if print_version {
-                println!(
-                    "NCA {} keygen {} -> {}",
-                    nca.nca_name,
-                    parsed.key_generation(),
-                    parsed.key_generation().min(new_keygen)
-                );
+            crate::formats::nca::rewrite_header_for_xci(&enc_header, ks, title_key, gc_flag)?;
+        if let Some(cap) = effective_rsvcap {
+            if nca.nca_name.ends_with(".cnmt.nca") {
+                src.seek(SeekFrom::Start(nca.abs_offset))?;
+                let mut full_nca = vec![0u8; nca.size as usize];
+                src.read_exact(&mut full_nca)?;
+                if let Some((patched, before, after)) =
+                    crate::formats::nca::patch_meta_nca_with_rsvcap(&full_nca, ks, cap, keypatch)?
+                {
+                    if print_version {
+                        println!("CNMT {} RSV {} -> {}", nca.nca_name, before, after);
+                    }
+                    patched_header = patched[..0xC00].to_vec();
+                    final_nca = Some(patched);
+                }
             }
+        }
+        if let Some(new_keygen) = keypatch {
+            if new_keygen < parsed.crypto_type2 {
+                patched_header = crate::formats::nca::rewrite_header_with_keygen(
+                    &patched_header,
+                    ks,
+                    new_keygen,
+                    true,
+                )?;
+                if print_version {
+                    println!(
+                        "NCA {} keygen {} -> {}",
+                        nca.nca_name,
+                        parsed.crypto_type2,
+                        new_keygen
+                    );
+                }
+            }
+        }
+        if let Some(bytes) = &mut final_nca {
+            bytes[..0xC00].copy_from_slice(&patched_header);
         }
         let hash = crate::crypto::hash::sha256(&patched_header[..0x200]);
         secure_builder.add_file(nca.nca_name.clone(), nca.size, hash, 0x200);
@@ -1149,7 +1153,7 @@ fn build_xci_output(
             source_path: nca.source_path.clone(),
             abs_offset: nca.abs_offset,
             size: nca.size,
-            patched_header,
+            patched_header: final_nca.unwrap_or(patched_header),
         });
     }
 

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -93,7 +93,9 @@ fn build_report_nsp(path: &str, ks: &KeyStore) -> Result<Report> {
     let mut file = BufReader::new(File::open(path)?);
     let nsp = Nsp::parse(&mut file)?;
     let groups = group_nsp_entries(&nsp, &mut file, path, ks)?;
-    build_report_from_groups(&mut file, &groups, ks)
+    let mut report = build_report_from_groups(&mut file, &groups, ks)?;
+    apply_nsp_cnmt_xml_overrides(&mut file, &nsp, &mut report)?;
+    Ok(report)
 }
 
 fn build_report_xci(path: &str, ks: &KeyStore) -> Result<Report> {
@@ -285,6 +287,40 @@ fn analyze_group<R: Read + Seek>(
     }
 
     Ok(analysis)
+}
+
+fn apply_nsp_cnmt_xml_overrides<R: Read + Seek>(
+    reader: &mut R,
+    nsp: &Nsp,
+    report: &mut Report,
+) -> Result<()> {
+    let mut overrides = HashMap::new();
+    for entry in nsp.all_entries() {
+        if !entry.name.to_ascii_lowercase().ends_with(".cnmt.xml") {
+            continue;
+        }
+        let data = nsp.pfs0.read_file(reader, &entry.name)?;
+        if let Some(rsv) = parse_cnmt_xml_required_system_version(&data) {
+            overrides.insert(entry.name.to_ascii_lowercase(), rsv);
+        }
+    }
+
+    for title in &mut report.titles {
+        let xml_name = format!("{}.xml", title.meta_name.trim_end_matches(".nca")).to_ascii_lowercase();
+        if let Some(rsv) = overrides.get(&xml_name) {
+            title.required_system_version = *rsv;
+        }
+    }
+    Ok(())
+}
+
+fn parse_cnmt_xml_required_system_version(xml: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(xml).ok()?;
+    let start_tag = "<RequiredSystemVersion>";
+    let end_tag = "</RequiredSystemVersion>";
+    let start = text.find(start_tag)? + start_tag.len();
+    let end = text[start..].find(end_tag)? + start;
+    text[start..end].trim().parse::<u32>().ok()
 }
 
 fn build_adv_content_text(report: &Report) -> String {

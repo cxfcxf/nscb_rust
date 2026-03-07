@@ -19,7 +19,13 @@ pub fn copy_with_progress<R: Read, W: Write>(
         let to_read = buf.len().min(remaining as usize);
         let n = src.read(&mut buf[..to_read])?;
         if n == 0 {
-            break;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!(
+                    "source ended early: {} bytes remaining out of {}",
+                    remaining, size
+                ),
+            ));
         }
         dst.write_all(&buf[..n])?;
         remaining -= n as u64;
@@ -41,6 +47,36 @@ pub fn copy_section<R: Read + Seek, W: Write>(
 ) -> std::io::Result<u64> {
     src.seek(SeekFrom::Start(offset))?;
     copy_with_progress(src, dst, size, pb)
+}
+
+/// Copy up to `size` bytes from a specific offset in src, stopping cleanly at EOF.
+pub fn copy_section_tolerant<R: Read + Seek, W: Write>(
+    src: &mut R,
+    dst: &mut W,
+    offset: u64,
+    size: u64,
+    pb: Option<&ProgressBar>,
+) -> std::io::Result<u64> {
+    src.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; CHUNK_SIZE];
+    let mut remaining = size;
+    let mut total = 0u64;
+
+    while remaining > 0 {
+        let to_read = buf.len().min(remaining as usize);
+        let n = src.read(&mut buf[..to_read])?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n])?;
+        remaining -= n as u64;
+        total += n as u64;
+        if let Some(pb) = pb {
+            pb.inc(n as u64);
+        }
+    }
+
+    Ok(total)
 }
 
 /// Write padding zeros to align the writer position.

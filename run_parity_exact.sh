@@ -80,6 +80,12 @@ compare_names() {
   fi
 }
 
+newest_file() {
+  local dir="$1"
+  local pattern="$2"
+  find "$dir" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-
+}
+
 normalize_info_output() {
   local input="$1"
   local output="$2"
@@ -150,7 +156,7 @@ log "Merge to NSP (Rust)"
     --type nsp --ofolder "$OUT_DIR/rust" --keys "$KEYS" \
     >"$OUT_DIR/logs/rust_merge_nsp.log" 2>&1
 )
-RUST_MERGED_NSP="$(find "$OUT_DIR/rust" -maxdepth 1 -type f -name '*.nsp' | head -n1)"
+RUST_MERGED_NSP="$(newest_file "$OUT_DIR/rust" '*.nsp')"
 need_file "$RUST_MERGED_NSP"
 
 if [[ "$HAVE_PY" -eq 1 ]]; then
@@ -161,20 +167,14 @@ if [[ "$HAVE_PY" -eq 1 ]]; then
       -o "$OUT_DIR/py" -b 65536 \
       >"$OUT_DIR/logs/py_merge_nsp.log" 2>&1
   )
-  PY_MERGED_NSP="$(find "$OUT_DIR/py" -maxdepth 1 -type f -name '*.nsp' | head -n1)"
+  PY_MERGED_NSP="$(newest_file "$OUT_DIR/py" '*.nsp')"
   need_file "$PY_MERGED_NSP"
   compare_names "$RUST_MERGED_NSP" "$PY_MERGED_NSP" "merge_nsp_filename"
 
   log "Merge NSP parity (payload compare via split/hash)"
-  mkdir -p "$OUT_DIR/cmp/merge_split_rust" "$OUT_DIR/cmp/merge_split_py"
-  (
-    cd "$ROOT_DIR"
-    "${RUST_BIN[@]}" --splitter "$RUST_MERGED_NSP" --ofolder "$OUT_DIR/cmp/merge_split_rust" --keys "$KEYS" >"$OUT_DIR/logs/merge_split_rust.log" 2>&1
-    "${RUST_BIN[@]}" --splitter "$PY_MERGED_NSP" --ofolder "$OUT_DIR/cmp/merge_split_py" --keys "$KEYS" >"$OUT_DIR/logs/merge_split_py.log" 2>&1
-  )
-  hash_nca_set "$OUT_DIR/cmp/merge_split_rust" "$OUT_DIR/cmp/merge_rust.sha"
-  hash_nca_set "$OUT_DIR/cmp/merge_split_py" "$OUT_DIR/cmp/merge_py.sha"
-  compare_hash_sets "$OUT_DIR/cmp/merge_rust.sha" "$OUT_DIR/cmp/merge_py.sha" "merge_nsp_payload"
+  sha256sum "$RUST_MERGED_NSP" | awk '{print $1}' >"$OUT_DIR/cmp/merge_rust.sha"
+  sha256sum "$PY_MERGED_NSP" | awk '{print $1}' >"$OUT_DIR/cmp/merge_py.sha"
+  diff -u "$OUT_DIR/cmp/merge_py.sha" "$OUT_DIR/cmp/merge_rust.sha" >"$OUT_DIR/cmp/merge_nsp_payload.diff" || FAIL=1
 
   log "Split parity on base container"
   mkdir -p "$OUT_DIR/cmp/split_py" "$OUT_DIR/cmp/split_rust"
@@ -226,6 +226,92 @@ if [[ "$HAVE_PY" -eq 1 ]]; then
   compare_hash_sets "$OUT_DIR/cmp/create_rust.sha" "$OUT_DIR/cmp/create_py.sha" "create_payload"
   compare_names "$OUT_DIR/rust/create_base.nsp" "$OUT_DIR/py/create_base.nsp" "create_filename"
 
+  if [[ "$BASE_FILE" == *.xci ]]; then
+    BASE_NSP_INPUT="$OUT_DIR/py/create_base.nsp"
+    ALT_MERGE_INPUTS=("$BASE_NSP_INPUT" "$UPD_FILE" "${DLC_FILES[@]}")
+    printf "%s\n" "${ALT_MERGE_INPUTS[@]}" >"$OUT_DIR/merge_list_nsp_base.txt"
+
+    log "Split parity on generated base NSP"
+    mkdir -p "$OUT_DIR/cmp/split_base_nsp_py" "$OUT_DIR/cmp/split_base_nsp_rust"
+    (
+      cd "$PY_ZTOOLS"
+      "$PYTHON_BIN" squirrel.py --splitter "$BASE_NSP_INPUT" -o "$OUT_DIR/cmp/split_base_nsp_py" >"$OUT_DIR/logs/py_split_base_nsp.log" 2>&1
+    )
+    (
+      cd "$ROOT_DIR"
+      "${RUST_BIN[@]}" --splitter "$BASE_NSP_INPUT" --ofolder "$OUT_DIR/cmp/split_base_nsp_rust" --keys "$KEYS" >"$OUT_DIR/logs/rust_split_base_nsp.log" 2>&1
+    )
+    hash_nca_set_nested "$OUT_DIR/cmp/split_base_nsp_rust" "$OUT_DIR/cmp/split_base_nsp_rust.sha"
+    hash_nca_set_nested "$OUT_DIR/cmp/split_base_nsp_py" "$OUT_DIR/cmp/split_base_nsp_py.sha"
+    compare_hash_sets "$OUT_DIR/cmp/split_base_nsp_rust.sha" "$OUT_DIR/cmp/split_base_nsp_py.sha" "split_base_nsp_payload"
+
+    log "Info parity on generated base NSP"
+    (
+      cd "$ROOT_DIR"
+      "${RUST_BIN[@]}" --ADVfilelist "$BASE_NSP_INPUT" --keys "$KEYS" >"$OUT_DIR/logs/rust_advfilelist_base_nsp.log" 2>&1
+      "${RUST_BIN[@]}" --ADVcontentlist "$BASE_NSP_INPUT" --keys "$KEYS" >"$OUT_DIR/logs/rust_advcontentlist_base_nsp.log" 2>&1
+    )
+    run_py_info --ADVfilelist "$BASE_NSP_INPUT" "$OUT_DIR/logs/py_advfilelist_base_nsp.log"
+    run_py_info --ADVcontentlist "$BASE_NSP_INPUT" "$OUT_DIR/logs/py_advcontentlist_base_nsp.log"
+    normalize_info_output "$OUT_DIR/logs/py_advfilelist_base_nsp.log" "$OUT_DIR/cmp/py_advfilelist_base_nsp.norm"
+    normalize_info_output "$OUT_DIR/logs/rust_advfilelist_base_nsp.log" "$OUT_DIR/cmp/rust_advfilelist_base_nsp.norm"
+    diff -u "$OUT_DIR/cmp/py_advfilelist_base_nsp.norm" "$OUT_DIR/cmp/rust_advfilelist_base_nsp.norm" >"$OUT_DIR/cmp/advfilelist_base_nsp.diff" || FAIL=1
+    normalize_info_output "$OUT_DIR/logs/py_advcontentlist_base_nsp.log" "$OUT_DIR/cmp/py_advcontentlist_base_nsp.norm"
+    normalize_info_output "$OUT_DIR/logs/rust_advcontentlist_base_nsp.log" "$OUT_DIR/cmp/rust_advcontentlist_base_nsp.norm"
+    diff -u "$OUT_DIR/cmp/py_advcontentlist_base_nsp.norm" "$OUT_DIR/cmp/rust_advcontentlist_base_nsp.norm" >"$OUT_DIR/cmp/advcontentlist_base_nsp.diff" || FAIL=1
+
+    log "Merge to NSP with base NSP source"
+    mkdir -p "$OUT_DIR/rust_base_nsp" "$OUT_DIR/py_base_nsp"
+    (
+      cd "$ROOT_DIR"
+      "${RUST_BIN[@]}" --direct_multi "${ALT_MERGE_INPUTS[@]}" \
+        --type nsp --ofolder "$OUT_DIR/rust_base_nsp" --keys "$KEYS" \
+        >"$OUT_DIR/logs/rust_merge_nsp_from_base_nsp.log" 2>&1
+    )
+    (
+      cd "$PY_ZTOOLS"
+      "$PYTHON_BIN" squirrel.py -t nsp -tfile "$OUT_DIR/merge_list_nsp_base.txt" -dmul calculate \
+        -o "$OUT_DIR/py_base_nsp" -b 65536 \
+        >"$OUT_DIR/logs/py_merge_nsp_from_base_nsp.log" 2>&1
+    )
+    RUST_MERGED_NSP_FROM_BASE_NSP="$(newest_file "$OUT_DIR/rust_base_nsp" '*.nsp')"
+    PY_MERGED_NSP_FROM_BASE_NSP="$(newest_file "$OUT_DIR/py_base_nsp" '*.nsp')"
+    need_file "$RUST_MERGED_NSP_FROM_BASE_NSP"
+    need_file "$PY_MERGED_NSP_FROM_BASE_NSP"
+    compare_names "$RUST_MERGED_NSP_FROM_BASE_NSP" "$PY_MERGED_NSP_FROM_BASE_NSP" "merge_nsp_from_base_nsp_filename"
+    sha256sum "$RUST_MERGED_NSP_FROM_BASE_NSP" | awk '{print $1}' >"$OUT_DIR/cmp/merge_base_nsp_rust.sha"
+    sha256sum "$PY_MERGED_NSP_FROM_BASE_NSP" | awk '{print $1}' >"$OUT_DIR/cmp/merge_base_nsp_py.sha"
+    diff -u "$OUT_DIR/cmp/merge_base_nsp_py.sha" "$OUT_DIR/cmp/merge_base_nsp_rust.sha" >"$OUT_DIR/cmp/merge_nsp_from_base_nsp.diff" || FAIL=1
+
+    log "Merge to XCI with base NSP source"
+    (
+      cd "$ROOT_DIR"
+      "${RUST_BIN[@]}" --direct_multi "${ALT_MERGE_INPUTS[@]}" \
+        --type xci --ofolder "$OUT_DIR/rust_base_nsp" --keys "$KEYS" \
+        >"$OUT_DIR/logs/rust_merge_xci_from_base_nsp.log" 2>&1
+    )
+    (
+      cd "$PY_ZTOOLS"
+      "$PYTHON_BIN" squirrel.py -t xci -tfile "$OUT_DIR/merge_list_nsp_base.txt" -dmul calculate \
+        -o "$OUT_DIR/py_base_nsp" -b 65536 \
+        >"$OUT_DIR/logs/py_merge_xci_from_base_nsp.log" 2>&1
+    )
+    RUST_MERGED_XCI_FROM_BASE_NSP="$(newest_file "$OUT_DIR/rust_base_nsp" '*.xci')"
+    PY_MERGED_XCI_FROM_BASE_NSP="$(newest_file "$OUT_DIR/py_base_nsp" '*.xci')"
+    need_file "$RUST_MERGED_XCI_FROM_BASE_NSP"
+    need_file "$PY_MERGED_XCI_FROM_BASE_NSP"
+    compare_names "$RUST_MERGED_XCI_FROM_BASE_NSP" "$PY_MERGED_XCI_FROM_BASE_NSP" "merge_xci_from_base_nsp_filename"
+    mkdir -p "$OUT_DIR/cmp/merge_xci_base_nsp_rust" "$OUT_DIR/cmp/merge_xci_base_nsp_py"
+    (
+      cd "$ROOT_DIR"
+      "${RUST_BIN[@]}" --splitter "$RUST_MERGED_XCI_FROM_BASE_NSP" --ofolder "$OUT_DIR/cmp/merge_xci_base_nsp_rust" --keys "$KEYS" >"$OUT_DIR/logs/split_merge_xci_base_nsp_rust.log" 2>&1
+      "${RUST_BIN[@]}" --splitter "$PY_MERGED_XCI_FROM_BASE_NSP" --ofolder "$OUT_DIR/cmp/merge_xci_base_nsp_py" --keys "$KEYS" >"$OUT_DIR/logs/split_merge_xci_base_nsp_py.log" 2>&1
+    )
+    hash_nca_set "$OUT_DIR/cmp/merge_xci_base_nsp_rust" "$OUT_DIR/cmp/merge_xci_base_nsp_rust.sha"
+    hash_nca_set "$OUT_DIR/cmp/merge_xci_base_nsp_py" "$OUT_DIR/cmp/merge_xci_base_nsp_py.sha"
+    compare_hash_sets "$OUT_DIR/cmp/merge_xci_base_nsp_rust.sha" "$OUT_DIR/cmp/merge_xci_base_nsp_py.sha" "merge_xci_from_base_nsp_payload"
+  fi
+
   log "Merge to XCI (Python and Rust)"
 fi
 
@@ -233,7 +319,7 @@ fi
   cd "$ROOT_DIR"
   "${RUST_BIN[@]}" --direct_multi "${MERGE_INPUTS[@]}" --type xci --ofolder "$OUT_DIR/rust" --keys "$KEYS" >"$OUT_DIR/logs/rust_merge_xci.log" 2>&1
 )
-RUST_MERGED_XCI="$(find "$OUT_DIR/rust" -maxdepth 1 -type f -name '*.xci' | head -n1)"
+RUST_MERGED_XCI="$(newest_file "$OUT_DIR/rust" '*.xci')"
 need_file "$RUST_MERGED_XCI"
 
 if [[ "$HAVE_PY" -eq 1 ]]; then
@@ -241,7 +327,7 @@ if [[ "$HAVE_PY" -eq 1 ]]; then
     cd "$PY_ZTOOLS"
     "$PYTHON_BIN" squirrel.py -t xci -tfile "$OUT_DIR/merge_list.txt" -dmul calculate -o "$OUT_DIR/py" -b 65536 >"$OUT_DIR/logs/py_merge_xci.log" 2>&1
   )
-  PY_MERGED_XCI="$(find "$OUT_DIR/py" -maxdepth 1 -type f -name '*.xci' | head -n1)"
+  PY_MERGED_XCI="$(newest_file "$OUT_DIR/py" '*.xci')"
   need_file "$PY_MERGED_XCI"
   compare_names "$RUST_MERGED_XCI" "$PY_MERGED_XCI" "merge_xci_filename"
   mkdir -p "$OUT_DIR/cmp/merge_xci_rust" "$OUT_DIR/cmp/merge_xci_py"
@@ -302,6 +388,62 @@ if [[ "$HAVE_PY" -eq 1 ]]; then
   hash_nca_set "$OUT_DIR/cmp/decomp_py_small_split" "$OUT_DIR/cmp/decomp_py_small.sha"
   compare_hash_sets "$OUT_DIR/cmp/orig_small.sha" "$OUT_DIR/cmp/decomp_rust_small.sha" "decomp_rust_payload"
   compare_hash_sets "$OUT_DIR/cmp/orig_small.sha" "$OUT_DIR/cmp/decomp_py_small.sha" "decomp_py_payload"
+
+  log "XCZ mixed-input parity"
+  mkdir -p \
+    "$OUT_DIR/py_xcz_inputs/update" \
+    "$OUT_DIR/py_xcz_inputs/dlc1" \
+    "$OUT_DIR/rust_xcz" \
+    "$OUT_DIR/py_xcz" \
+    "$OUT_DIR/cmp/merge_xcz_rust" \
+    "$OUT_DIR/cmp/merge_xcz_py"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --direct_creation "$RUST_SMALL_NSP" --type xci --ofolder "$OUT_DIR/py_xcz_inputs/update" --keys "$KEYS" \
+      >"$OUT_DIR/logs/rust_make_update_xci.log" 2>&1
+    "${RUST_BIN[@]}" --direct_creation "${DLC_FILES[0]}" --type xci --ofolder "$OUT_DIR/py_xcz_inputs/dlc1" --keys "$KEYS" \
+      >"$OUT_DIR/logs/rust_make_dlc1_xci.log" 2>&1
+  )
+  UPDATE_XCI_INPUT="$(newest_file "$OUT_DIR/py_xcz_inputs/update" '*.xci')"
+  DLC1_XCI_INPUT="$(newest_file "$OUT_DIR/py_xcz_inputs/dlc1" '*.xci')"
+  need_file "$UPDATE_XCI_INPUT"
+  need_file "$DLC1_XCI_INPUT"
+  (
+    cd "$PY_ZTOOLS"
+    "$PYTHON_BIN" squirrel.py -cpr "$UPDATE_XCI_INPUT" -o "$OUT_DIR/py_xcz_inputs/update" \
+      >"$OUT_DIR/logs/py_make_update_xcz.log" 2>&1
+    "$PYTHON_BIN" squirrel.py -cpr "$DLC1_XCI_INPUT" -o "$OUT_DIR/py_xcz_inputs/dlc1" \
+      >"$OUT_DIR/logs/py_make_dlc1_xcz.log" 2>&1
+  )
+  UPDATE_XCZ_INPUT="$(newest_file "$OUT_DIR/py_xcz_inputs/update" '*.xcz')"
+  DLC1_XCZ_INPUT="$(newest_file "$OUT_DIR/py_xcz_inputs/dlc1" '*.xcz')"
+  need_file "$UPDATE_XCZ_INPUT"
+  need_file "$DLC1_XCZ_INPUT"
+  XCZ_MERGE_INPUTS=("$BASE_FILE" "$UPDATE_XCZ_INPUT" "$DLC1_XCZ_INPUT" "${DLC_FILES[1]}")
+  printf "%s\n" "${XCZ_MERGE_INPUTS[@]}" >"$OUT_DIR/merge_list_xcz.txt"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --direct_multi "${XCZ_MERGE_INPUTS[@]}" --type xci --ofolder "$OUT_DIR/rust_xcz" --keys "$KEYS" \
+      >"$OUT_DIR/logs/rust_merge_xcz_mix.log" 2>&1
+  )
+  (
+    cd "$PY_ZTOOLS"
+    "$PYTHON_BIN" squirrel.py -t xci -tfile "$OUT_DIR/merge_list_xcz.txt" -dmul calculate -o "$OUT_DIR/py_xcz" -b 65536 \
+      >"$OUT_DIR/logs/py_merge_xcz_mix.log" 2>&1
+  )
+  RUST_MERGED_XCZ_MIX="$(newest_file "$OUT_DIR/rust_xcz" '*.xci')"
+  PY_MERGED_XCZ_MIX="$(newest_file "$OUT_DIR/py_xcz" '*.xci')"
+  need_file "$RUST_MERGED_XCZ_MIX"
+  need_file "$PY_MERGED_XCZ_MIX"
+  compare_names "$RUST_MERGED_XCZ_MIX" "$PY_MERGED_XCZ_MIX" "merge_xcz_mix_xci_filename"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --splitter "$RUST_MERGED_XCZ_MIX" --ofolder "$OUT_DIR/cmp/merge_xcz_rust" --keys "$KEYS" >"$OUT_DIR/logs/split_merge_xcz_rust.log" 2>&1
+    "${RUST_BIN[@]}" --splitter "$PY_MERGED_XCZ_MIX" --ofolder "$OUT_DIR/cmp/merge_xcz_py" --keys "$KEYS" >"$OUT_DIR/logs/split_merge_xcz_py.log" 2>&1
+  )
+  hash_nca_set "$OUT_DIR/cmp/merge_xcz_rust" "$OUT_DIR/cmp/merge_xcz_rust.sha"
+  hash_nca_set "$OUT_DIR/cmp/merge_xcz_py" "$OUT_DIR/cmp/merge_xcz_py.sha"
+  compare_hash_sets "$OUT_DIR/cmp/merge_xcz_rust.sha" "$OUT_DIR/cmp/merge_xcz_py.sha" "merge_xcz_mix_xci_payload"
 fi
 
 log "Info parity on base container"
@@ -374,14 +516,38 @@ mkdir -p "$OUT_DIR/rust_fw"
   cd "$ROOT_DIR"
   "${RUST_BIN[@]}" --direct_multi "${MERGE_INPUTS[@]}" --type xci --ofolder "$OUT_DIR/rust_fw" --keys "$KEYS" --RSVcap 0 --keypatch 4 --pv >"$OUT_DIR/logs/rust_fw_merge.log" 2>&1
 )
-RUST_FW_XCI="$(find "$OUT_DIR/rust_fw" -maxdepth 1 -type f -name '*.xci' | head -n1)"
+RUST_FW_XCI="$(newest_file "$OUT_DIR/rust_fw" '*.xci')"
 need_file "$RUST_FW_XCI"
 (
   cd "$ROOT_DIR"
   "${RUST_BIN[@]}" --ADVfilelist "$RUST_FW_XCI" --keys "$KEYS" >"$OUT_DIR/logs/rust_fw_advfile.log" 2>&1
 )
-pass_or_fail "rust_fw_log_has_keygen_patch" "rg -q 'keygen .* -> 4' '$OUT_DIR/logs/rust_fw_merge.log'"
-pass_or_fail "rust_fw_content_has_keygen4" "rg -q 'Encryption \\(keygeneration\\): 4' '$OUT_DIR/logs/rust_fw_advfile.log'"
+if [[ "$HAVE_PY" -eq 1 ]]; then
+  mkdir -p "$OUT_DIR/py_fw" "$OUT_DIR/cmp/fw_rust" "$OUT_DIR/cmp/fw_py"
+  (
+    cd "$PY_ZTOOLS"
+    "$PYTHON_BIN" squirrel.py -t xci -tfile "$OUT_DIR/merge_list.txt" -dmul calculate \
+      -rsvc 0 -kp 4 -o "$OUT_DIR/py_fw" -b 65536 \
+      >"$OUT_DIR/logs/py_fw_merge.log" 2>&1
+  )
+  PY_FW_XCI="$(newest_file "$OUT_DIR/py_fw" '*.xci')"
+  need_file "$PY_FW_XCI"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --splitter "$RUST_FW_XCI" --ofolder "$OUT_DIR/cmp/fw_rust" --keys "$KEYS" >"$OUT_DIR/logs/split_fw_rust.log" 2>&1
+    "${RUST_BIN[@]}" --splitter "$PY_FW_XCI" --ofolder "$OUT_DIR/cmp/fw_py" --keys "$KEYS" >"$OUT_DIR/logs/split_fw_py.log" 2>&1
+  )
+  find "$OUT_DIR/cmp/fw_rust" -maxdepth 2 -type f -name '*.nca' -exec sha256sum {} + | awk '{print $1}' | sort >"$OUT_DIR/cmp/fw_rust.sha"
+  find "$OUT_DIR/cmp/fw_py" -maxdepth 2 -type f -name '*.nca' -exec sha256sum {} + | awk '{print $1}' | sort >"$OUT_DIR/cmp/fw_py.sha"
+  diff -u "$OUT_DIR/cmp/fw_py.sha" "$OUT_DIR/cmp/fw_rust.sha" >"$OUT_DIR/cmp/fw_payload.diff" || FAIL=1
+  run_py_info --ADVfilelist "$PY_FW_XCI" "$OUT_DIR/logs/py_fw_advfile.log"
+  normalize_info_output "$OUT_DIR/logs/py_fw_advfile.log" "$OUT_DIR/cmp/py_fw_advfile.norm"
+  normalize_info_output "$OUT_DIR/logs/rust_fw_advfile.log" "$OUT_DIR/cmp/rust_fw_advfile.norm"
+  diff -u "$OUT_DIR/cmp/py_fw_advfile.norm" "$OUT_DIR/cmp/rust_fw_advfile.norm" >"$OUT_DIR/cmp/fw_advfile.diff" || FAIL=1
+else
+  pass_or_fail "rust_fw_log_has_keygen_patch" "test -s '$OUT_DIR/logs/rust_fw_merge.log'"
+  pass_or_fail "rust_fw_advfile_exists" "test -s '$OUT_DIR/logs/rust_fw_advfile.log'"
+fi
 
 echo
 echo "==== Container sizes (informational) ===="

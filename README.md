@@ -37,9 +37,11 @@ target/release/nscb
 
 - On tag push, GitHub Actions builds and publishes:
   - `nscb_rust.exe`
+  - `nscb_rust-linux-amd64`
+  - `nscb_rust-macos-arm64`
   - Trigger pattern: `v*` (example: `v0.1.0`)
 - Workflow file:
-  - `.github/workflows/release-windows.yml`
+  - `.github/workflows/release.yml`
 
 ### Local cross-build from Linux (optional)
 
@@ -211,24 +213,28 @@ Use the included parity runner to compare Rust outputs against NSC_BUILDER Pytho
 - split parity
 - create parity
 - compress/decompress parity
+- XCZ mixed-input merge parity
 - `ADVcontentlist` output parity
 - `ADVfilelist` output parity
 - `dspl` filename parity
 - firmware-control regression
+
+The Rust binary never delegates to `squirrel.py`. The Python reference is only used by the parity harness for comparison.
 
 Common env vars:
 
 - `TEST_DIR`: folder containing test inputs and `prod.keys`
 - `BASE_FILE`: base input file
 - `UPD_FILE`: update input file
-- `MERGE_EXTRA`: newline-separated extra merge inputs (typically DLC files)
 - `SMALL_NSZ`: small NSZ file for compress/decompress checks
 - `OUT_DIR`: output artifacts/logs folder
 - `PY_REPO`: local NSC_BUILDER clone path
 - `PY_ZTOOLS`: override `py/ztools` inside the Python reference tree
 - `PYTHON_BIN`: override the Python interpreter used for parity runs
-- `NSCB_PY_ZTOOLS`: override the Python helper path used by the Rust merge XML fallback
-- `NSCB_PYTHON`: override the Python interpreter used by the Rust merge XML fallback
+
+Compression note:
+- decompressed payload parity is enforced
+- compressed `.nsz` / `.xcz` byte streams are not required to match Python bit-for-bit
 
 Default reference layout:
 
@@ -246,13 +252,11 @@ Example (`E:\dumps\game_set` on WSL as `/mnt/e/dumps/game_set`):
 BASE_FILE="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[APP\]' | head -n1)"
 UPD_FILE="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[UPD\]' | head -n1)"
 SMALL_NSZ="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[DLC' | head -n1)"
-MERGE_EXTRA="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[DLC' | sort)"
 TEST_DIR=/mnt/e/dumps/game_set \
 OUT_DIR=.qa_suite/parity_example \
 PY_REPO=.qa_suite/reference/NSC_BUILDER \
 BASE_FILE="$BASE_FILE" \
 UPD_FILE="$UPD_FILE" \
 SMALL_NSZ="$SMALL_NSZ" \
-MERGE_EXTRA="$MERGE_EXTRA" \
 ./run_parity_exact.sh
 ```

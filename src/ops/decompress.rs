@@ -64,7 +64,7 @@ fn decompress_nsz(input_path: &str, output_path: &str) -> Result<()> {
                 .map(|s| s.offset + s.size)
                 .max()
                 .unwrap_or(entry.size);
-            ncz::decompress_ncz(&mut file, &mut tmp, nca_size, abs_offset)?;
+            ncz::decompress_ncz(&mut file, &mut tmp, nca_size, abs_offset, entry.size)?;
             let actual_size = tmp.as_file().metadata()?.len();
             decompressed_files.push((nca_name, tmp, actual_size));
         } else {
@@ -128,7 +128,7 @@ fn decompress_xcz(input_path: &str, output_path: &str) -> Result<()> {
                 .map(|s| s.offset + s.size)
                 .max()
                 .unwrap_or(entry.size);
-            ncz::decompress_ncz(&mut file, &mut tmp, nca_size, abs_offset)?;
+            ncz::decompress_ncz(&mut file, &mut tmp, nca_size, abs_offset, entry.size)?;
             decomp_pb.inc(entry.size);
             let size = tmp.as_file().metadata()?.len();
             let hash = hash_first_n_from_temp(&mut tmp, size.min(0x200))?;
@@ -242,13 +242,28 @@ fn decompress_xcz(input_path: &str, output_path: &str) -> Result<()> {
                         uio::copy_with_progress(tmp, &mut out, e.size, Some(&pb))?;
                     }
                     EntrySource::Input { abs_offset, size } => {
-                        uio::copy_section(&mut file, &mut out, *abs_offset, *size, Some(&pb))?;
+                        let copied = uio::copy_section_tolerant(
+                            &mut file,
+                            &mut out,
+                            *abs_offset,
+                            *size,
+                            Some(&pb),
+                        )?;
+                        if copied < *size {
+                            uio::write_padding(&mut out, *size - copied)?;
+                            pb.inc(*size - copied);
+                        }
                     }
                 }
             }
         } else {
             let abs_offset = xci.root_hfs0.file_abs_offset(root_e);
-            uio::copy_section(&mut file, &mut out, abs_offset, root_e.size, Some(&pb))?;
+            let copied =
+                uio::copy_section_tolerant(&mut file, &mut out, abs_offset, root_e.size, Some(&pb))?;
+            if copied < root_e.size {
+                uio::write_padding(&mut out, root_e.size - copied)?;
+                pb.inc(root_e.size - copied);
+            }
         }
     }
 
@@ -271,7 +286,8 @@ fn decompress_single_ncz(input_path: &str, output_path: &str) -> Result<()> {
         .unwrap_or(0);
 
     let mut out = File::create(output_path)?;
-    ncz::decompress_ncz(&mut file, &mut out, nca_size, 0)?;
+    let compressed_size = file.get_ref().metadata()?.len();
+    ncz::decompress_ncz(&mut file, &mut out, nca_size, 0, compressed_size)?;
     out.flush()?;
 
     println!("Written: {}", output_path);

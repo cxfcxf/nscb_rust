@@ -4,6 +4,7 @@ use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::crypto::hash;
 use crate::error::{NscbError, Result};
+use crate::formats::types;
 use crate::util::align::align_up;
 
 pub const HFS0_MAGIC: &[u8; 4] = b"HFS0";
@@ -110,7 +111,8 @@ impl Hfs0 {
             });
         }
 
-        let header_size = 0x10 + (file_count as u64 * ENTRY_SIZE) + string_table_size as u64;
+        let raw_header_size = 0x10 + (file_count as u64 * ENTRY_SIZE) + string_table_size as u64;
+        let header_size = align_up(raw_header_size, types::MEDIA_SIZE);
         let data_offset = offset + header_size;
 
         Ok(Self {
@@ -277,6 +279,7 @@ impl Hfs0Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn test_build_header_aligned_to_media_unit() {
@@ -287,5 +290,21 @@ mod tests {
         let header = b.build_header_aligned(0x200);
         assert_eq!(&header[0..4], HFS0_MAGIC);
         assert_eq!(header.len() as u64 % 0x200, 0);
+    }
+
+    #[test]
+    fn test_parse_aligned_header_uses_aligned_data_offset() {
+        let mut b = Hfs0Builder::new();
+        b.add_file("secure".to_string(), 0x20, [0u8; 32], 0x20);
+        let header = b.build_header_aligned(0x200);
+        let mut image = header.clone();
+        image.extend_from_slice(&[0xAB; 0x20]);
+
+        let mut cur = Cursor::new(image);
+        let hfs0 = Hfs0::parse_at(&mut cur, 0).unwrap();
+        assert_eq!(hfs0.header_size, 0x200);
+        assert_eq!(hfs0.data_offset, 0x200);
+        let entry = hfs0.find("secure").unwrap();
+        assert_eq!(hfs0.file_abs_offset(entry), 0x200);
     }
 }

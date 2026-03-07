@@ -193,6 +193,7 @@ pub fn decompress_ncz<R: Read + Seek, W: Read + Write + Seek>(
     writer: &mut W,
     total_nca_size: u64,
     offset: u64,
+    compressed_size: u64,
 ) -> Result<()> {
     let ncz = NczReader::parse_at(reader, offset)?;
 
@@ -201,18 +202,20 @@ pub fn decompress_ncz<R: Read + Seek, W: Read + Write + Seek>(
 
     // Seek to compressed data
     reader.seek(SeekFrom::Start(ncz.data_start))?;
+    let stream_size = compressed_size.saturating_sub(ncz.data_start.saturating_sub(offset));
+    let mut limited = reader.take(stream_size);
 
     let mut written = ncz.nca_header.len() as u64;
     let target = total_nca_size;
 
     if ncz.is_stream {
         // Stream-based: decompress a single zstd stream
-        decompress_stream(reader, writer, &mut written, target)?;
+        decompress_stream(&mut limited, writer, &mut written, target)?;
     } else if let Some(block_table) = &ncz.block_table {
         // Block-based: decompress individual blocks
         let block_size = 1usize << block_table.block_size_exponent;
         decompress_blocks(
-            reader,
+            &mut limited,
             writer,
             block_table,
             block_size,

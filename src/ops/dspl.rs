@@ -171,7 +171,12 @@ fn write_group_as_xci(
         } else {
             None
         };
-        let patched_header = crate::formats::nca::rewrite_header_for_xci(&enc_header, ks, title_key)?;
+        let patched_header = crate::formats::nca::rewrite_header_for_xci(
+            &enc_header,
+            ks,
+            title_key,
+            parsed.distribution_type,
+        )?;
         let hash = crate::crypto::hash::sha256(&patched_header[..0x200]);
         secure_builder.add_file(entry.name.clone(), entry.size, hash, 0x200);
         prepared.push(PreparedNca {

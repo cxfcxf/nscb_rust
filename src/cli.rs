@@ -113,11 +113,7 @@ pub fn dispatch(args: Args) -> Result<()> {
         let file_refs: Vec<&str> = filtered_files.clone();
         let merge_name = build_merge_filename_metadata(&file_refs, &args.output_type, &ks)
             .unwrap_or_else(|| build_merge_filename(&file_refs, &args.output_type));
-        let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp")
-            && file_refs.iter().any(|p| {
-                let lower = p.to_ascii_lowercase();
-                lower.ends_with(".xci") || lower.ends_with(".xcz")
-            });
+        let nsp_direct_multi_python_mode = args.output_type.eq_ignore_ascii_case("nsp");
         let output = make_output_path(
             filtered_files.first().copied().unwrap_or("merged"),
             &args.ofolder,

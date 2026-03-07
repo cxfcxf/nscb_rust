@@ -3,8 +3,12 @@ use std::io::{Read, Seek, SeekFrom};
 use crate::crypto::aes_ecb;
 use crate::crypto::aes_xts::NintendoXts;
 use crate::error::{NscbError, Result};
+use crate::formats::pfs0::Pfs0;
 use crate::formats::types::*;
 use crate::keys::KeyStore;
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
+use aes::Aes128;
+use sha2::{Digest, Sha256};
 
 /// NCA section table entry (16 bytes each, 4 entries at header offset 0x240).
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +197,15 @@ impl NcaHeader {
         self.crypto_type.max(self.crypto_type2)
     }
 
+    /// Key generation as interpreted by squirrel.py's patcher_meta path.
+    pub fn python_patcher_key_generation(&self) -> u8 {
+        if self.crypto_type == 2 {
+            self.crypto_type.max(self.crypto_type2)
+        } else {
+            self.crypto_type2
+        }
+    }
+
     /// Master key revision for key derivation (key_generation - 1, clamped to 0).
     pub fn master_key_revision(&self) -> u8 {
         let kg = self.key_generation();
@@ -260,6 +273,20 @@ impl NcaHeader {
         nonce
     }
 
+    /// Get the filesystem crypto counter as squirrel.py derives it in `BaseFs`.
+    /// It builds a 16-byte counter from 8 zero bytes plus FS header bytes 0x140..0x148,
+    /// then reverses the full 16-byte buffer.
+    pub fn section_crypto_counter(&self, section_index: usize) -> [u8; 16] {
+        let fs_header_offset = 0x400 + section_index * 0x200;
+        let counter_offset = fs_header_offset + 0x140;
+        let mut counter = [0u8; 16];
+        if counter_offset + 8 <= self.raw.len() {
+            counter[8..].copy_from_slice(&self.raw[counter_offset..counter_offset + 8]);
+        }
+        counter.reverse();
+        counter
+    }
+
     /// Get the filesystem type byte from the section FS header.
     /// Offset 0x03 in each FS header (0x400 + section_index * 0x200 + 0x03).
     pub fn section_fs_type(&self, section_index: usize) -> u8 {
@@ -285,6 +312,26 @@ impl NcaHeader {
     /// Get the raw decrypted header bytes.
     pub fn raw_bytes(&self) -> &[u8] {
         &self.raw
+    }
+
+    pub fn hblock_block_size(&self) -> u32 {
+        u32::from_le_bytes(self.raw[0x428..0x42C].try_into().unwrap_or([0u8; 4]))
+    }
+
+    pub fn htable_offset(&self) -> u64 {
+        u64::from_le_bytes(self.raw[0x430..0x438].try_into().unwrap_or([0u8; 8]))
+    }
+
+    pub fn htable_size(&self) -> u64 {
+        u64::from_le_bytes(self.raw[0x438..0x440].try_into().unwrap_or([0u8; 8]))
+    }
+
+    pub fn pfs0_offset(&self) -> u64 {
+        u64::from_le_bytes(self.raw[0x440..0x448].try_into().unwrap_or([0u8; 8]))
+    }
+
+    pub fn pfs0_size(&self) -> u64 {
+        u64::from_le_bytes(self.raw[0x448..0x450].try_into().unwrap_or([0u8; 8]))
     }
 }
 
@@ -330,6 +377,7 @@ pub fn rewrite_header_for_xci(
     encrypted_header: &[u8],
     ks: &KeyStore,
     title_key: Option<[u8; 16]>,
+    gamecard_flag: u8,
 ) -> Result<Vec<u8>> {
     let (mut dec, key, le_sector) = decrypt_header_for_edit(encrypted_header, ks)?;
 
@@ -337,6 +385,7 @@ pub fn rewrite_header_for_xci(
     let key_index = dec[0x207];
     let key_generation = dec[0x206].max(dec[0x220]);
 
+    dec[0x204] = gamecard_flag;
     // Clear rights ID for gamecard-style headers.
     dec[0x230..0x240].fill(0);
 
@@ -364,6 +413,32 @@ pub fn rewrite_header_for_xci(
     Ok(dec)
 }
 
+pub fn python_xci_is_cartridge(headers: &[NcaHeader], ks: &KeyStore) -> bool {
+    !headers.is_empty()
+        && headers.iter().all(|header| {
+            if header.distribution_type != 0 {
+                return true;
+            }
+            header
+                .decrypt_key_area(ks)
+                .map(|keys| keys[0].iter().all(|&b| b == 0))
+                .unwrap_or(false)
+        })
+}
+
+pub fn python_xci_gamecard_flag(header: &NcaHeader, ks: &KeyStore, is_cartridge: bool) -> u8 {
+    if !is_cartridge {
+        return 0;
+    }
+    if header.distribution_type != 0 {
+        return 1;
+    }
+    header
+        .decrypt_key_area(ks)
+        .map(|keys| if keys[0].iter().all(|&b| b == 0) { 1 } else { 0 })
+        .unwrap_or(0)
+}
+
 /// Rewrite encrypted NCA header to force eShop distribution flag.
 ///
 /// Mirrors NSC_BUILDER create path behavior where `setgamecard(0)` is applied
@@ -382,15 +457,22 @@ pub fn rewrite_header_with_keygen(
     new_keygen: u8,
     _for_xci: bool,
 ) -> Result<Vec<u8>> {
-    let (mut dec, key, le_sector) = decrypt_header_for_edit(encrypted_header, ks)?;
-    let old_keygen = dec[0x206].max(dec[0x220]);
-    let patched_keygen = old_keygen.min(new_keygen);
-    let key_index = dec[0x207];
-    let has_rights = dec[0x230..0x240].iter().any(|&b| b != 0);
+    if encrypted_header.len() < 0xC00 {
+        return Err(NscbError::InvalidData("NCA header too short".into()));
+    }
 
-    if patched_keygen != old_keygen && !has_rights {
-        let old_mkrev = old_keygen.saturating_sub(1);
-        let new_mkrev = patched_keygen.saturating_sub(1);
+    let (mut dec, key, le_sector) = decrypt_header_for_edit(encrypted_header, ks)?;
+    let old_crypto2 = dec[0x220];
+    if new_keygen >= old_crypto2 {
+        return Ok(encrypted_header[..0xC00].to_vec());
+    }
+
+    let key_index = dec[0x207];
+    let key_block_nonzero = dec[0x300..0x340].iter().any(|&b| b != 0);
+
+    if key_block_nonzero {
+        let old_mkrev = old_crypto2.saturating_sub(1);
+        let new_mkrev = new_keygen.saturating_sub(1);
         let old_kak = ks.key_area_key(old_mkrev, key_index)?;
         let new_kak = ks.key_area_key(new_mkrev, key_index)?;
         for i in 0..4 {
@@ -403,12 +485,239 @@ pub fn rewrite_header_with_keygen(
         }
     }
 
-    dec[0x206] = dec[0x206].min(patched_keygen);
-    dec[0x220] = dec[0x220].min(patched_keygen);
+    let (crypto1, crypto2) = if new_keygen >= 3 {
+        (2, new_keygen)
+    } else if new_keygen == 2 {
+        (2, 0)
+    } else {
+        (new_keygen, 0)
+    };
+    dec[0x206] = crypto1;
+    dec[0x220] = crypto2;
 
     let xts = NintendoXts::new(&key)?;
     xts.encrypt_with_endian(0, &mut dec, le_sector);
     Ok(dec)
+}
+
+pub fn patch_meta_nca_with_rsvcap(
+    encrypted_nca: &[u8],
+    ks: &KeyStore,
+    new_rsv: u32,
+    keygen_hint: Option<u8>,
+) -> Result<Option<(Vec<u8>, u32, u32)>> {
+    if encrypted_nca.len() < 0xC00 {
+        return Err(NscbError::InvalidData("NCA image too short".into()));
+    }
+
+    let (mut header_dec, xts_key, le_sector) = decrypt_header_for_edit(&encrypted_nca[..0xC00], ks)?;
+    let header = NcaHeader::from_decrypted(header_dec.clone())?;
+    if header.content_type_enum() != Some(ContentType::Meta) {
+        return Ok(None);
+    }
+
+    let section_keys = header.decrypt_key_area(ks)?;
+
+    for sec_idx in 0..4 {
+        let sec = &header.section_table[sec_idx];
+        if !sec.is_present() || sec.size() == 0 {
+            continue;
+        }
+        let sec_start = sec.start_offset() as usize;
+        let sec_end = sec.end_offset() as usize;
+        if sec_end > encrypted_nca.len() || sec_start >= sec_end {
+            continue;
+        }
+
+        let section_enc = &encrypted_nca[sec_start..sec_end];
+            if let Some((mut section_plain, mode, before, after)) =
+            patch_meta_section(section_enc, &header, sec_idx, &section_keys, new_rsv, keygen_hint)
+            {
+            update_meta_hashes(&mut header_dec, &mut section_plain, &header)?;
+
+            let mut output = encrypted_nca.to_vec();
+            match mode {
+                SectionCryptoMode::Raw => {
+                    output[sec_start..sec_end].copy_from_slice(&section_plain);
+                }
+                SectionCryptoMode::Ctr {
+                    key,
+                    nonce,
+                    file_offset,
+                    little_endian,
+                } => {
+                    let mut reenc = section_plain;
+                    aes_ctr_transform_in_place(&key, &nonce, file_offset, little_endian, &mut reenc);
+                    output[sec_start..sec_end].copy_from_slice(&reenc);
+                }
+            }
+
+            let xts = NintendoXts::new(&xts_key)?;
+            xts.encrypt_with_endian(0, &mut header_dec, le_sector);
+            output[..0xC00].copy_from_slice(&header_dec);
+            return Ok(Some((output, before, after)));
+        }
+    }
+
+    Ok(None)
+}
+
+#[derive(Clone, Copy)]
+enum SectionCryptoMode {
+    Raw,
+    Ctr {
+        key: [u8; 16],
+        nonce: [u8; 8],
+        file_offset: u64,
+        little_endian: bool,
+    },
+}
+
+fn patch_meta_section(
+    section_enc: &[u8],
+    header: &NcaHeader,
+    sec_idx: usize,
+    section_keys: &[[u8; 16]; 4],
+    new_rsv: u32,
+    keygen_hint: Option<u8>,
+) -> Option<(Vec<u8>, SectionCryptoMode, u32, u32)> {
+    let mut raw = section_enc.to_vec();
+    if let Some((before, after)) =
+        patch_cnmt_required_system_version_in_section(&mut raw, header, new_rsv, keygen_hint)
+    {
+        return Some((raw, SectionCryptoMode::Raw, before, after));
+    }
+
+    let nonce = header.section_ctr_nonce(sec_idx);
+    for key in section_keys {
+        for &file_offset in &[header.section_table[sec_idx].start_offset(), 0u64] {
+            for &little_endian in &[true, false] {
+                let mut dec = section_enc.to_vec();
+                aes_ctr_transform_in_place(key, &nonce, file_offset, little_endian, &mut dec);
+                if let Some((before, after)) =
+                    patch_cnmt_required_system_version_in_section(&mut dec, header, new_rsv, keygen_hint)
+                {
+                    return Some((
+                        dec,
+                        SectionCryptoMode::Ctr {
+                            key: *key,
+                            nonce,
+                            file_offset,
+                            little_endian,
+                        },
+                        before,
+                        after,
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn patch_cnmt_required_system_version_in_section(
+    section_plain: &mut [u8],
+    header: &NcaHeader,
+    new_rsv: u32,
+    keygen_hint: Option<u8>,
+) -> Option<(u32, u32)> {
+    for off in pfs0_candidate_offsets(section_plain) {
+        let mut cursor = std::io::Cursor::new(&section_plain[..]);
+        let Ok(pfs) = Pfs0::parse_at(&mut cursor, off as u64) else {
+            continue;
+        };
+        for entry in &pfs.entries {
+            if !entry.name.ends_with(".cnmt") {
+                continue;
+            }
+            let abs = pfs.file_abs_offset(entry) as usize;
+            let end = abs.saturating_add(entry.size as usize);
+            if end > section_plain.len() || abs + 0x2C > end {
+                continue;
+            }
+            let mut cnmt = crate::formats::cnmt::Cnmt::from_bytes(&section_plain[abs..end]).ok()?;
+            let before = cnmt.required_system_version;
+            let keygen = keygen_hint.unwrap_or_else(|| header.python_patcher_key_generation());
+            let after = crate::formats::types::apply_patcher_meta_rsv(keygen, before, new_rsv);
+            cnmt.patch_required_system_version(after);
+            section_plain[abs..end].copy_from_slice(&cnmt.raw);
+            return Some((before, after));
+        }
+    }
+    None
+}
+
+fn update_meta_hashes(
+    header_dec: &mut [u8],
+    section_plain: &mut [u8],
+    header: &NcaHeader,
+) -> Result<()> {
+    let block_size = header.hblock_block_size() as usize;
+    let htable_offset = header.htable_offset() as usize;
+    let htable_size = header.htable_size() as usize;
+    let pfs0_offset = header.pfs0_offset() as usize;
+    let pfs0_size = header.pfs0_size() as usize;
+    if block_size == 0 || pfs0_size == 0 {
+        return Ok(());
+    }
+
+    let mult = pfs0_size.div_ceil(block_size);
+    let pfs0_hash_len = 0x20usize.saturating_mul(mult);
+    if htable_offset + pfs0_hash_len > section_plain.len() || pfs0_offset + pfs0_size > section_plain.len() {
+        return Ok(());
+    }
+
+    let pfs0_block_len = block_size.min(pfs0_size);
+    let pfs0_hash = Sha256::digest(&section_plain[pfs0_offset..pfs0_offset + pfs0_block_len]);
+    section_plain[htable_offset..htable_offset + 0x20].copy_from_slice(&pfs0_hash);
+
+    let htable_hash = Sha256::digest(&section_plain[htable_offset..htable_offset + pfs0_hash_len.min(htable_size)]);
+    header_dec[0x408..0x428].copy_from_slice(&htable_hash);
+
+    let hblock_hash = Sha256::digest(&header_dec[0x400..0x600]);
+    header_dec[0x280..0x2A0].copy_from_slice(&hblock_hash);
+
+    Ok(())
+}
+
+fn pfs0_candidate_offsets(section: &[u8]) -> Vec<usize> {
+    let mut out = vec![0usize];
+    let scan_len = section.len().min(1024 * 1024);
+    for i in 0..scan_len.saturating_sub(4) {
+        if &section[i..i + 4] == b"PFS0" {
+            out.push(i);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn aes_ctr_transform_in_place(
+    key: &[u8; 16],
+    nonce8: &[u8; 8],
+    file_offset: u64,
+    little_endian: bool,
+    data: &mut [u8],
+) {
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut block_index = file_offset >> 4;
+    for chunk in data.chunks_mut(16) {
+        let mut counter_block = [0u8; 16];
+        counter_block[..8].copy_from_slice(nonce8);
+        if little_endian {
+            counter_block[8..].copy_from_slice(&block_index.to_le_bytes());
+        } else {
+            counter_block[8..].copy_from_slice(&block_index.to_be_bytes());
+        }
+        let mut block = GenericArray::clone_from_slice(&counter_block);
+        cipher.encrypt_block(&mut block);
+        for (dst, src) in chunk.iter_mut().zip(block.as_slice()) {
+            *dst ^= *src;
+        }
+        block_index = block_index.wrapping_add(1);
+    }
 }
 
 /// Summary info for an NCA file (parsed from header).
