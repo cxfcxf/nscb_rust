@@ -216,6 +216,14 @@ impl Cnmt {
         let revision = self.version & 0xFFFF;
         format!("{}.{}.{}.{}", major, minor, patch, revision)
     }
+
+    pub fn patch_required_system_version(&mut self, new_rsv: u32) {
+        let capped = self.required_system_version.min(new_rsv);
+        if self.raw.len() >= 0x2C {
+            self.raw[0x28..0x2C].copy_from_slice(&capped.to_le_bytes());
+        }
+        self.required_system_version = capped;
+    }
 }
 
 #[cfg(test)]

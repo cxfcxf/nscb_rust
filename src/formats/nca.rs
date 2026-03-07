@@ -323,7 +323,7 @@ fn decrypt_header_for_edit(encrypted: &[u8], ks: &KeyStore) -> Result<(Vec<u8>, 
 /// Rewrite an encrypted NCA header for gamecard/XCI style distribution.
 ///
 /// This mirrors NSC_BUILDER behavior:
-/// - set distribution type to gamecard (0x01)
+/// - preserve the original gamecard/eShop flag from the source header
 /// - clear rights ID
 /// - for rights-based NCAs, re-encrypt title key into all key area slots
 pub fn rewrite_header_for_xci(
@@ -337,9 +337,6 @@ pub fn rewrite_header_for_xci(
     let key_index = dec[0x207];
     let key_generation = dec[0x206].max(dec[0x220]);
 
-    // NSC_BUILDER usually keeps digital sets as non-gamecard.
-    // Mirror that default instead of forcing 1.
-    dec[0x204] = 0x00;
     // Clear rights ID for gamecard-style headers.
     dec[0x230..0x240].fill(0);
 
@@ -374,6 +371,41 @@ pub fn rewrite_header_for_xci(
 pub fn rewrite_header_for_nsp(encrypted_header: &[u8], ks: &KeyStore) -> Result<Vec<u8>> {
     let (mut dec, key, le_sector) = decrypt_header_for_edit(encrypted_header, ks)?;
     dec[0x204] = 0x00;
+    let xts = NintendoXts::new(&key)?;
+    xts.encrypt_with_endian(0, &mut dec, le_sector);
+    Ok(dec)
+}
+
+pub fn rewrite_header_with_keygen(
+    encrypted_header: &[u8],
+    ks: &KeyStore,
+    new_keygen: u8,
+    _for_xci: bool,
+) -> Result<Vec<u8>> {
+    let (mut dec, key, le_sector) = decrypt_header_for_edit(encrypted_header, ks)?;
+    let old_keygen = dec[0x206].max(dec[0x220]);
+    let patched_keygen = old_keygen.min(new_keygen);
+    let key_index = dec[0x207];
+    let has_rights = dec[0x230..0x240].iter().any(|&b| b != 0);
+
+    if patched_keygen != old_keygen && !has_rights {
+        let old_mkrev = old_keygen.saturating_sub(1);
+        let new_mkrev = patched_keygen.saturating_sub(1);
+        let old_kak = ks.key_area_key(old_mkrev, key_index)?;
+        let new_kak = ks.key_area_key(new_mkrev, key_index)?;
+        for i in 0..4 {
+            let base = 0x300 + i * 16;
+            let mut encrypted_slot = [0u8; 16];
+            encrypted_slot.copy_from_slice(&dec[base..base + 16]);
+            let clear_slot = aes_ecb::decrypt_block(&old_kak, &encrypted_slot)?;
+            let reenc_slot = aes_ecb::encrypt_block(&new_kak, &clear_slot)?;
+            dec[base..base + 16].copy_from_slice(&reenc_slot);
+        }
+    }
+
+    dec[0x206] = dec[0x206].min(patched_keygen);
+    dec[0x220] = dec[0x220].min(patched_keygen);
+
     let xts = NintendoXts::new(&key)?;
     xts.encrypt_with_endian(0, &mut dec, le_sector);
     Ok(dec)

@@ -5,10 +5,14 @@ Rust implementation of core Nintendo Switch content workflows inspired by NSC_Bu
 Implemented operations:
 - Merge (`--direct_multi`, `-d`)
 - Split (`--splitter`)
+- Split to repacked files (`--dspl`)
 - Create/Repack NSP from folder (`--create` + `--ifolder`)
 - Convert NSP/XCI (`--direct_creation`, `-c`)
 - Compress NSP/XCI (`--compress`, `-z`)
 - Decompress NSZ/XCZ/NCZ (`--decompress`)
+- Content viewer (`--ADVcontentlist`)
+- Metadata/file list (`--ADVfilelist`)
+- Firmware controls on merge (`--RSVcap`, `--keypatch`, `--pv`)
 
 ## Requirements
 
@@ -109,7 +113,33 @@ Expected create behavior:
   - Split merged file with `--splitter`
   - Repack one split folder with `--create`
 
-### 4) Convert NSP -> XCI
+### 4) Split to per-title NSP/XCI files
+
+```bash
+target/release/nscb \
+  --dspl "merged.xci" \
+  --type nsp \
+  --keys /path/to/prod.keys \
+  -o /path/to/output
+```
+
+### 5) View detailed container contents
+
+```bash
+target/release/nscb \
+  --ADVcontentlist "game.nsp_or_xci" \
+  --keys /path/to/prod.keys
+```
+
+### 6) View title metadata summary
+
+```bash
+target/release/nscb \
+  --ADVfilelist "game.nsp_or_xci" \
+  --keys /path/to/prod.keys
+```
+
+### 7) Convert NSP -> XCI
 
 ```bash
 target/release/nscb \
@@ -119,7 +149,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 5) Convert XCI -> NSP
+### 8) Convert XCI -> NSP
 
 ```bash
 target/release/nscb \
@@ -129,7 +159,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 6) Compress NSP -> NSZ (or XCI -> XCZ)
+### 9) Compress NSP -> NSZ (or XCI -> XCZ)
 
 ```bash
 target/release/nscb \
@@ -139,11 +169,24 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 7) Decompress NSZ -> NSP (or XCZ -> XCI, NCZ -> NCA)
+### 10) Decompress NSZ -> NSP (or XCZ -> XCI, NCZ -> NCA)
 
 ```bash
 target/release/nscb \
   --decompress "game.nsz" \
+  --keys /path/to/prod.keys \
+  -o /path/to/output
+```
+
+### 11) Merge with firmware caps
+
+```bash
+target/release/nscb \
+  -d "base.xci" "update.nsz" "dlc1.nsp" "dlc2.nsp" \
+  --type xci \
+  --RSVcap 0 \
+  --keypatch 4 \
+  --pv \
   --keys /path/to/prod.keys \
   -o /path/to/output
 ```
@@ -163,6 +206,16 @@ Use the included parity runner to compare Rust outputs against NSC_BUILDER Pytho
 ./run_parity_exact.sh
 ```
 
+`run_parity_exact.sh` is the single canonical regression entrypoint. It covers:
+- merge parity (`nsp` and `xci`)
+- split parity
+- create parity
+- compress/decompress parity
+- `ADVcontentlist` output parity
+- `ADVfilelist` output parity
+- `dspl` filename parity
+- firmware-control regression
+
 Common env vars:
 
 - `TEST_DIR`: folder containing test inputs and `prod.keys`
@@ -172,13 +225,20 @@ Common env vars:
 - `SMALL_NSZ`: small NSZ file for compress/decompress checks
 - `OUT_DIR`: output artifacts/logs folder
 - `PY_REPO`: local NSC_BUILDER clone path
+- `PY_ZTOOLS`: override `py/ztools` inside the Python reference tree
+- `PYTHON_BIN`: override the Python interpreter used for parity runs
+- `NSCB_PY_ZTOOLS`: override the Python helper path used by the Rust merge XML fallback
+- `NSCB_PYTHON`: override the Python interpreter used by the Rust merge XML fallback
 
-For exact mixed-input merge parity (`direct_multi -t nsp` quirks), set:
+Default reference layout:
 
 ```bash
-NSCB_PY_ZTOOLS=/tmp/NSC_BUILDER_cfx/py/ztools
-NSCB_PYTHON=/tmp/NSC_BUILDER_cfx/.venv/bin/python
+$PWD/.qa_suite/reference/NSC_BUILDER
+├── .venv/
+└── py/ztools/
 ```
+
+If you keep the Python reference tree there, no extra env vars are required.
 
 Example (`E:\dumps\game_set` on WSL as `/mnt/e/dumps/game_set`):
 
@@ -188,10 +248,8 @@ UPD_FILE="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '
 SMALL_NSZ="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[DLC' | head -n1)"
 MERGE_EXTRA="$(find /mnt/e/dumps/game_set -maxdepth 1 -type f -iname '*.nsz' | rg '\[DLC' | sort)"
 TEST_DIR=/mnt/e/dumps/game_set \
-OUT_DIR=/tmp/parity_example \
-PY_REPO=/tmp/NSC_BUILDER_cfx \
-NSCB_PY_ZTOOLS=/tmp/NSC_BUILDER_cfx/py/ztools \
-NSCB_PYTHON=/tmp/NSC_BUILDER_cfx/.venv/bin/python \
+OUT_DIR=.qa_suite/parity_example \
+PY_REPO=.qa_suite/reference/NSC_BUILDER \
 BASE_FILE="$BASE_FILE" \
 UPD_FILE="$UPD_FILE" \
 SMALL_NSZ="$SMALL_NSZ" \

@@ -1,0 +1,90 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            label: windows-amd64
+            artifact_name: nscb_rust.exe
+            binary_path: target/release/nscb.exe
+          - runner: ubuntu-latest
+            label: linux-amd64
+            artifact_name: nscb_rust-linux-amd64
+            binary_path: target/release/nscb
+          - runner: macos-latest
+            label: macos-arm64
+            artifact_name: nscb_rust-macos-arm64
+            binary_path: target/release/nscb
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Copy-Item "${{ matrix.binary_path }}" "artifacts/${{ matrix.artifact_name }}"
+
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp "${{ matrix.binary_path }}" "artifacts/${{ matrix.artifact_name }}"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: artifacts/${{ matrix.artifact_name }}
+
+  release:
+    name: Publish release assets
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download workflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Flatten release artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          find release-artifacts -type f -exec cp {} artifacts/ \;
+          ls -la artifacts
+
+      - name: Create or update GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          tag="${{ github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/* --clobber
+          else
+            gh release create "$tag" artifacts/* --title "Release $tag" --generate-notes
+          fi

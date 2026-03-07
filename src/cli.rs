@@ -24,6 +24,18 @@ pub struct Args {
     #[arg(long = "splitter", num_args = 1)]
     pub splitter: Option<String>,
 
+    /// Print full container content details
+    #[arg(long = "ADVcontentlist", num_args = 1)]
+    pub adv_contentlist: Option<String>,
+
+    /// Print title metadata summary
+    #[arg(long = "ADVfilelist", num_args = 1)]
+    pub adv_filelist: Option<String>,
+
+    /// Split multi-title file into repacked NSP/XCI files
+    #[arg(long = "dspl", num_args = 1)]
+    pub dspl: Option<String>,
+
     /// Create/repack NSP from an input folder
     #[arg(long = "create", num_args = 1)]
     pub create: Option<String>,
@@ -60,6 +72,18 @@ pub struct Args {
     /// Exclude delta fragment NCAs
     #[arg(long = "nodelta", short = 'n')]
     pub nodelta: bool,
+
+    /// Cap RequiredSystemVersion during merge
+    #[arg(long = "RSVcap")]
+    pub rsvcap: Option<u32>,
+
+    /// Lower NCA key generation during merge
+    #[arg(long = "keypatch", short = 'k')]
+    pub keypatch: Option<u8>,
+
+    /// Print before/after firmware info during merge
+    #[arg(long = "pv")]
+    pub print_version: bool,
 
     /// Compression level (1-22, default 3)
     #[arg(long = "level", default_value = "3")]
@@ -106,12 +130,28 @@ pub fn dispatch(args: Args) -> Result<()> {
             args.nodelta,
             &args.output_type,
             nsp_direct_multi_python_mode,
+            args.rsvcap,
+            args.keypatch,
+            args.print_version,
         );
     }
 
     if let Some(path) = &args.splitter {
         let output_dir = args.ofolder.as_deref().unwrap_or("./split");
         return crate::ops::split::split(path, output_dir, &ks);
+    }
+
+    if let Some(path) = &args.adv_contentlist {
+        return crate::ops::info::content_list(path, &ks);
+    }
+
+    if let Some(path) = &args.adv_filelist {
+        return crate::ops::info::file_list(path, &ks);
+    }
+
+    if let Some(path) = &args.dspl {
+        let output_dir = args.ofolder.as_deref().unwrap_or("./split");
+        return crate::ops::dspl::split_to_files(path, output_dir, &args.output_type, &ks);
     }
 
     if let Some(output_path) = &args.create {
@@ -426,7 +466,7 @@ fn build_merge_filename(input_paths: &[&str], output_type: &str) -> String {
     }
 
     // Build the filename
-    let name = game_name.unwrap_or_else(|| "merged".to_string());
+    let name = python_title_spacing(&game_name.unwrap_or_else(|| "merged".to_string()));
     let tid = base_title_id.unwrap_or_else(|| "0000000000000000".to_string());
     let ver = latest_version.unwrap_or_else(|| "0".to_string());
 
@@ -534,6 +574,7 @@ fn build_merge_filename_metadata(
     let name = title_name
         .filter(|s| !s.trim().is_empty() && s != "DLC")
         .unwrap_or_else(|| infer_game_name_from_path(input_paths.first().copied().unwrap_or("merged")));
+    let name = python_title_spacing(&name);
     let ver = latest_version.unwrap_or(0);
 
     let mut ccount = String::new();
@@ -879,6 +920,24 @@ fn infer_game_name_from_path(path_str: &str) -> String {
     } else {
         n.to_string()
     }
+}
+
+fn python_title_spacing(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "merged".to_string();
+    }
+    let has_non_ascii = trimmed.chars().any(|ch| !ch.is_ascii());
+    let has_ascii_alpha = trimmed.chars().any(|ch| ch.is_ascii_alphabetic());
+    if has_non_ascii && !has_ascii_alpha {
+        let compact: Vec<char> = trimmed.chars().filter(|ch| !ch.is_whitespace()).collect();
+        return compact
+            .iter()
+            .map(|ch| ch.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    trimmed.to_string()
 }
 
 #[cfg(test)]
