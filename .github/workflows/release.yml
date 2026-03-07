@@ -65,6 +65,9 @@ jobs:
     needs: build
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download workflow artifacts
         uses: actions/download-artifact@v4
         with:
@@ -84,7 +87,7 @@ jobs:
         run: |
           tag="${{ github.ref_name }}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" artifacts/* --clobber
+            gh release upload "$tag" artifacts/* --repo "${{ github.repository }}" --clobber
           else
-            gh release create "$tag" artifacts/* --title "Release $tag" --generate-notes
+            gh release create "$tag" artifacts/* --repo "${{ github.repository }}" --title "Release $tag" --generate-notes
           fi
