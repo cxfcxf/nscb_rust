@@ -2,19 +2,26 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_DIR="${TEST_DIR:-/mnt/e/test}"
+TEST_DIR="${TEST_DIR:-/mnt/e/test/uo}"
+MULTI_UPDATE_DIR="${MULTI_UPDATE_DIR:-/mnt/e/test/op}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/.qa_suite/exact_script}"
-KEYS="${KEYS:-$TEST_DIR/prod.keys}"
+KEYS="${KEYS:-/mnt/e/test/prod.keys}"
 PY_REPO="${PY_REPO:-$ROOT_DIR/.qa_suite/reference/NSC_BUILDER}"
 PY_ZTOOLS="${PY_ZTOOLS:-$PY_REPO/py/ztools}"
 PYTHON_BIN="${PYTHON_BIN:-$PY_REPO/.venv/bin/python}"
 RUST_BIN=("$ROOT_DIR/target/debug/nscb")
 FAIL=0
 
-BASE_FILE="${BASE_FILE:-$(find "$TEST_DIR" -maxdepth 1 -type f \( -name '*.xci' -o -name '*.nsp' \) ! -name '[[]UPD[]]*' ! -name '[[]DLC[]]*' | sort | head -n1)}"
+BASE_FILE="${BASE_FILE:-$(find "$TEST_DIR" -maxdepth 1 -type f -name '*.xci' | sort | head -n1)}"
+if [[ -z "$BASE_FILE" ]]; then
+  BASE_FILE="${BASE_FILE:-$(find "$TEST_DIR" -maxdepth 1 -type f -name '*.nsp' ! -name '[[]UPD[]]*' ! -name '[[]DLC[]]*' | sort | head -n1)}"
+fi
 UPD_FILE="${UPD_FILE:-$(find "$TEST_DIR" -maxdepth 1 -type f \( -name '[[]UPD[]]*.nsz' -o -name '[[]UPD[]]*.nsp' \) | sort | head -n1)}"
 SMALL_NSZ="${SMALL_NSZ:-$UPD_FILE}"
 mapfile -t DLC_FILES < <(find "$TEST_DIR" -maxdepth 1 -type f -name '[[]DLC[]]*.nsp' | sort)
+MULTI_BASE_FILE="${MULTI_BASE_FILE:-$(find "$MULTI_UPDATE_DIR" -maxdepth 1 -type f -name 'OCTOPATH TRAVELER*.nsp' ! -name '[[]UPD[]]*' | sort | head -n1)}"
+MULTI_UPD_OLD_FILE="${MULTI_UPD_OLD_FILE:-$(find "$MULTI_UPDATE_DIR" -maxdepth 1 -type f -name '[[]UPD[]]*v1.0.4*.nsp' | sort | head -n1)}"
+MULTI_UPD_NEW_FILE="${MULTI_UPD_NEW_FILE:-$(find "$MULTI_UPDATE_DIR" -maxdepth 1 -type f \( -name '[[]UPD[]]*v1.0.5*.nsz' -o -name '[[]UPD[]]*v1.0.5*.nsp' \) | sort | head -n1)}"
 
 need_file() {
   local p="$1"
@@ -169,6 +176,11 @@ fi
 HAVE_PY=0
 if [[ -f "$PY_ZTOOLS/squirrel.py" && -x "$PYTHON_BIN" ]]; then
   HAVE_PY=1
+fi
+
+HAVE_MULTI_UPDATE=0
+if [[ -f "$MULTI_BASE_FILE" && -f "$MULTI_UPD_OLD_FILE" && -f "$MULTI_UPD_NEW_FILE" ]]; then
+  HAVE_MULTI_UPDATE=1
 fi
 
 if [[ "$HAVE_PY" -eq 1 && ! -f "$PY_ZTOOLS/Fs/Nsp.py" ]]; then
@@ -644,6 +656,37 @@ if [[ "$HAVE_PY" -eq 1 ]]; then
 else
   pass_or_fail "rust_fw_log_has_keygen_patch" "test -s '$OUT_DIR/logs/rust_fw_merge.log'"
   pass_or_fail "rust_fw_advfile_exists" "test -s '$OUT_DIR/logs/rust_fw_advfile.log'"
+fi
+
+if [[ "$HAVE_MULTI_UPDATE" -eq 1 ]]; then
+  log "Multi-update selection regression"
+  mkdir -p "$OUT_DIR/multi_update_rust" "$OUT_DIR/multi_update_py"
+  printf "%s\n" "$MULTI_BASE_FILE" "$MULTI_UPD_OLD_FILE" "$MULTI_UPD_NEW_FILE" >"$OUT_DIR/multi_update_list.txt"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --direct_multi "$MULTI_BASE_FILE" "$MULTI_UPD_OLD_FILE" "$MULTI_UPD_NEW_FILE" \
+      --type nsp --ofolder "$OUT_DIR/multi_update_rust" --keys "$KEYS" \
+      >"$OUT_DIR/logs/rust_multi_update_merge.log" 2>&1
+    "${RUST_BIN[@]}" --ADVfilelist "$(newest_file "$OUT_DIR/multi_update_rust" '*.nsp')" --keys "$KEYS" \
+      >"$OUT_DIR/logs/rust_multi_update_advfile.log" 2>&1
+  )
+  RUST_MULTI_NSP="$(newest_file "$OUT_DIR/multi_update_rust" '*.nsp')"
+  need_file "$RUST_MULTI_NSP"
+  pass_or_fail "multi_update_rust_filename_uses_latest_version" "basename '$RUST_MULTI_NSP' | rg -q '\\[v327680\\]'"
+  pass_or_fail "multi_update_rust_reports_latest_display_version" "rg -q 'Display Version: 1\\.0\\.5' '$OUT_DIR/logs/rust_multi_update_advfile.log'"
+  pass_or_fail "multi_update_rust_reports_latest_patch_version" "rg -q 'Version: 327680 -> Patch \\(5\\)' '$OUT_DIR/logs/rust_multi_update_advfile.log'"
+
+  if [[ "$HAVE_PY" -eq 1 ]]; then
+    (
+      cd "$PY_ZTOOLS"
+      "$PYTHON_BIN" squirrel.py -t nsp -tfile "$OUT_DIR/multi_update_list.txt" -dmul calculate \
+        -o "$OUT_DIR/multi_update_py" -b 65536 \
+        >"$OUT_DIR/logs/py_multi_update_merge.log" 2>&1
+    )
+    PY_MULTI_NSP="$(newest_file "$OUT_DIR/multi_update_py" '*.nsp')"
+    need_file "$PY_MULTI_NSP"
+    compare_names "$RUST_MULTI_NSP" "$PY_MULTI_NSP" "multi_update_filename"
+  fi
 fi
 
 echo

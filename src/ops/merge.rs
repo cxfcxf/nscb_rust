@@ -17,6 +17,7 @@ use crate::formats::ticket::Ticket;
 use crate::formats::types::ContentType;
 use crate::formats::xci::Xci;
 use crate::keys::KeyStore;
+use crate::ops::split::{group_nsp_entries, group_xci_entries, TitleGroup};
 use crate::util::{io as uio, progress};
 
 /// An NCA file to be included in the merged output.
@@ -76,6 +77,12 @@ struct EffectiveInput {
     path: String,
     source_was_compressed: bool,
     container_hint: ContainerHint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedContent {
+    input_index: usize,
+    version: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -162,7 +169,13 @@ pub fn merge(
         }
     }
 
+    let selected_content_names = select_python_direct_multi_content(&effective_inputs, ks)?;
+
     for input in &effective_inputs {
+        let selected_names = selected_content_names
+            .get(input.path.as_str())
+            .cloned()
+            .unwrap_or_default();
         let path_str = input.path.as_str();
         let source_was_compressed = input.source_was_compressed;
         let path = Path::new(path_str);
@@ -187,6 +200,7 @@ pub fn merge(
                     keypatch,
                     source_was_compressed,
                     print_version,
+                    &selected_names,
                 )?;
             }
             ("xci", _) | ("", ContainerHint::XciLike) => {
@@ -202,6 +216,7 @@ pub fn merge(
                     keypatch,
                     source_was_compressed,
                     print_version,
+                    &selected_names,
                 )?;
             }
             _ => {
@@ -258,6 +273,71 @@ pub fn merge(
     Ok(())
 }
 
+fn select_python_direct_multi_content(
+    effective_inputs: &[EffectiveInput],
+    ks: &KeyStore,
+) -> Result<HashMap<String, HashSet<String>>> {
+    let mut groups_by_input: Vec<Vec<TitleGroup>> = Vec::with_capacity(effective_inputs.len());
+
+    for input in effective_inputs {
+        let groups = inspect_input_groups(input, ks)?;
+        groups_by_input.push(groups);
+    }
+
+    let best_by_title = pick_best_title_groups(&groups_by_input);
+    let mut selected_names_by_input: HashMap<String, HashSet<String>> = HashMap::new();
+    for (input_index, groups) in groups_by_input.into_iter().enumerate() {
+        let selected = groups
+            .into_iter()
+            .filter(|group| {
+                best_by_title
+                    .get(&group.title_id)
+                    .is_some_and(|picked| picked.input_index == input_index)
+            })
+            .flat_map(|group| group.entries.into_iter().map(|entry| entry.name))
+            .collect::<HashSet<_>>();
+        selected_names_by_input.insert(effective_inputs[input_index].path.clone(), selected);
+    }
+
+    Ok(selected_names_by_input)
+}
+
+fn pick_best_title_groups(groups_by_input: &[Vec<TitleGroup>]) -> HashMap<u64, SelectedContent> {
+    let mut best_by_title: HashMap<u64, SelectedContent> = HashMap::new();
+    for (input_index, groups) in groups_by_input.iter().enumerate() {
+        for group in groups {
+            let version = group.version.unwrap_or(0);
+            match best_by_title.get(&group.title_id) {
+                Some(current) if current.version >= version => {}
+                _ => {
+                    best_by_title.insert(
+                        group.title_id,
+                        SelectedContent {
+                            input_index,
+                            version,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    best_by_title
+}
+
+fn inspect_input_groups(input: &EffectiveInput, ks: &KeyStore) -> Result<Vec<TitleGroup>> {
+    let mut file = BufReader::new(File::open(&input.path)?);
+    match input.container_hint {
+        ContainerHint::NspLike => {
+            let nsp = Nsp::parse(&mut file)?;
+            group_nsp_entries(&nsp, &mut file, &input.path, ks)
+        }
+        ContainerHint::XciLike => {
+            let xci = Xci::parse(&mut file)?;
+            group_xci_entries(&xci, &mut file, &input.path, ks)
+        }
+    }
+}
+
 fn collect_from_nsp(
     path: &str,
     ks: &KeyStore,
@@ -271,6 +351,7 @@ fn collect_from_nsp(
     keypatch: Option<u8>,
     source_was_compressed: bool,
     print_version: bool,
+    selected_names: &HashSet<String>,
 ) -> Result<()> {
     let mut file = BufReader::new(File::open(path)?);
     let nsp = Nsp::parse(&mut file)?;
@@ -286,6 +367,9 @@ fn collect_from_nsp(
 
     // Python-style order: CNMT content entries first, then meta NCA.
     for meta in nsp.nca_entries().into_iter().filter(|e| e.name.ends_with(".cnmt.nca")) {
+        if !selected_names.contains(&meta.name) {
+            continue;
+        }
         let meta_abs = nsp.file_abs_offset(meta);
         maybe_add_generated_xml(
             &mut file,
@@ -304,6 +388,9 @@ fn collect_from_nsp(
             for c in &cnmt.content_entries {
                 let id = c.nca_id();
                 if let Some((abs_offset, size, name)) = id_to_entry.get(&id) {
+                    if !selected_names.contains(name) {
+                        continue;
+                    }
                     push_nca_if_new(
                         ncas,
                         seen,
@@ -348,6 +435,9 @@ fn collect_from_nsp(
 
     // Fallback: any remaining NCAs.
     for entry in nsp.nca_entries() {
+        if !selected_names.contains(&entry.name) {
+            continue;
+        }
         push_nca_if_new(
             ncas,
             seen,
@@ -364,6 +454,9 @@ fn collect_from_nsp(
 
     // Collect tickets
     for entry in nsp.ticket_entries() {
+        if !selected_names.contains(&entry.name) {
+            continue;
+        }
         tickets.push(TicketEntry {
             source_path: path.to_string(),
             name: entry.name.clone(),
@@ -374,6 +467,9 @@ fn collect_from_nsp(
 
     // Collect certs
     for entry in nsp.cert_entries() {
+        if !selected_names.contains(&entry.name) {
+            continue;
+        }
         certs.push(CertEntry {
             source_path: path.to_string(),
             name: entry.name.clone(),
@@ -397,6 +493,7 @@ fn collect_from_xci(
     keypatch: Option<u8>,
     source_was_compressed: bool,
     print_version: bool,
+    selected_names: &HashSet<String>,
 ) -> Result<()> {
     let mut file = BufReader::new(File::open(path)?);
     let xci = Xci::parse(&mut file)?;
@@ -404,6 +501,9 @@ fn collect_from_xci(
     let secure_entries = xci.secure_nca_entries(&mut file)?;
 
     for entry in &secure_entries {
+        if !selected_names.contains(&entry.name) {
+            continue;
+        }
         let nca_id = entry
             .name
             .trim_end_matches(".nca")
@@ -890,6 +990,59 @@ fn aes_ctr_transform_with_counter_in_place(
             cached_block_index = block_index;
         }
         *byte ^= cached_keystream[byte_in_block];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pick_best_title_groups, SelectedContent};
+    use crate::formats::types::TitleType;
+    use crate::ops::split::{GroupedEntry, TitleGroup};
+    use std::collections::HashMap;
+
+    fn fake_group(title_id: u64, version: u32, title_type: Option<TitleType>) -> TitleGroup {
+        TitleGroup {
+            title_id,
+            version: Some(version),
+            title_type,
+            game_name: "test".to_string(),
+            entries: vec![GroupedEntry {
+                name: format!("{title_id:016x}.nca"),
+                abs_offset: 0,
+                size: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn direct_multi_keeps_highest_version_per_title_id() {
+        let groups = vec![
+            vec![fake_group(0x0100_0000_0000_0800, 262_144, Some(TitleType::Patch))],
+            vec![fake_group(0x0100_0000_0000_0800, 327_680, Some(TitleType::Patch))],
+        ];
+        let picked = pick_best_title_groups(&groups);
+        let expected = HashMap::from([(
+            0x0100_0000_0000_0800,
+            SelectedContent {
+                input_index: 1,
+                version: 327_680,
+            },
+        )]);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.input_index), Some(1));
+        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.version), Some(327_680));
+        assert_eq!(picked, expected);
+    }
+
+    #[test]
+    fn direct_multi_keeps_first_when_versions_tie() {
+        let groups = vec![
+            vec![fake_group(0x0100_0000_0000_0800, 327_680, Some(TitleType::Patch))],
+            vec![fake_group(0x0100_0000_0000_0800, 327_680, Some(TitleType::Patch))],
+        ];
+        let picked = pick_best_title_groups(&groups);
+        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.input_index), Some(0));
+        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.version), Some(327_680));
     }
 }
 

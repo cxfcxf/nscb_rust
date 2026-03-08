@@ -218,6 +218,7 @@ Use the included parity runner to compare Rust outputs against NSC_BUILDER Pytho
 - `ADVfilelist` output parity
 - `dspl` filename parity
 - firmware-control regression
+- multi-update selection regression (`v1.0.4` + `v1.0.5` -> keep `v1.0.5`)
 
 The Rust binary never delegates to `squirrel.py`. The Python reference is only used by the parity harness for comparison.
 
@@ -230,8 +231,39 @@ mkdir -p .qa_suite/reference
 git clone https://github.com/cxcfxf/NSC_BUILDER .qa_suite/reference/NSC_BUILDER
 python3 -m venv .qa_suite/reference/NSC_BUILDER/.venv
 .qa_suite/reference/NSC_BUILDER/.venv/bin/pip install --upgrade pip setuptools wheel
-.qa_suite/reference/NSC_BUILDER/.venv/bin/pip install pycryptodome tqdm zstandard eel bottle bottle-websocket pywebview
+.qa_suite/reference/NSC_BUILDER/.venv/bin/pip install \
+  pycryptodome \
+  tqdm \
+  zstandard \
+  eel \
+  bottle \
+  bottle-websocket \
+  pywebview \
+  urllib3 \
+  beautifulsoup4 \
+  requests \
+  pillow \
+  chardet \
+  pykakasi \
+  googletrans==4.0.0rc1
 ```
+
+Modules that were required in practice to boot `squirrel.py` and run the parity suite:
+
+- `pycryptodome`
+- `tqdm`
+- `zstandard`
+- `eel`
+- `bottle`
+- `bottle-websocket`
+- `pywebview`
+- `urllib3`
+- `beautifulsoup4`
+- `requests`
+- `pillow`
+- `chardet`
+- `pykakasi`
+- `googletrans==4.0.0rc1`
 
 Expected layout:
 
@@ -246,13 +278,27 @@ If you keep the Python reference tree there, `run_parity_exact.sh` works without
 Common env vars:
 
 - `TEST_DIR`: folder containing test inputs and `prod.keys`
+- `MULTI_UPDATE_DIR`: separate folder for multi-update selection fixtures
 - `BASE_FILE`: base input file
 - `UPD_FILE`: update input file
+- `MULTI_BASE_FILE`: base file for the multi-update regression case
+- `MULTI_UPD_OLD_FILE`: older update file for the multi-update regression case
+- `MULTI_UPD_NEW_FILE`: newer update file for the multi-update regression case
 - `SMALL_NSZ`: small NSZ file for compress/decompress checks
 - `OUT_DIR`: output artifacts/logs folder
 - `PY_REPO`: local NSC_BUILDER clone path
 - `PY_ZTOOLS`: override `py/ztools` inside the Python reference tree
 - `PYTHON_BIN`: override the Python interpreter used for parity runs
+
+Current local fixture layout used by the parity script:
+
+- `/mnt/e/test/prod.keys`
+- `/mnt/e/test/uo`
+  Original Unicorn Overlord parity set:
+  base `.xci`, one update `.nsz`, two DLC `.nsp`
+- `/mnt/e/test/op`
+  Multi-update Octopath Traveler regression set:
+  base `.nsp`, update `v1.0.4`, update `v1.0.5`
 
 ### Intentional Differences
 
@@ -260,6 +306,8 @@ The suite is parity-first, but these differences are intentional and documented:
 
 - `ADVfilelist` line `Patchable to:` is not parity-gated for higher key generations.
   Rust uses the extended RSV floor table so firmware downgrade reporting stays consistent with actual merge behavior. The Python reference falls back incorrectly for higher keygens.
+- Multi-update `--direct_multi` NSP merges with duplicate-named update tickets/certs are not forced to match Python bit-for-bit.
+  Rust keeps the highest-version update cleanly. Python's NSP text-file merge path can append stale ticket/cert bytes from the older update while still advertising only the newer update in the header, producing a larger malformed-but-usable NSP. Rust intentionally does not reproduce that container bug.
 - Raw compressed `.nsz` / `.xcz` bytes are not parity-gated.
   The suite enforces decompressed payload parity and filename parity instead.
 - XCI files ignore the first `0x100` bytes for exact byte comparison.
@@ -281,5 +329,17 @@ PY_REPO=.qa_suite/reference/NSC_BUILDER \
 BASE_FILE="$BASE_FILE" \
 UPD_FILE="$UPD_FILE" \
 SMALL_NSZ="$SMALL_NSZ" \
+./run_parity_exact.sh
+```
+
+Example for the current local split fixture layout:
+
+```bash
+TEST_DIR=/mnt/e/test/uo \
+MULTI_UPDATE_DIR=/mnt/e/test/op \
+KEYS=/mnt/e/test/prod.keys \
+PY_REPO=.qa_suite/reference/NSC_BUILDER \
+PY_ZTOOLS=.qa_suite/reference/NSC_BUILDER/py/ztools \
+PYTHON_BIN=.qa_suite/reference/NSC_BUILDER/.venv/bin/python \
 ./run_parity_exact.sh
 ```
