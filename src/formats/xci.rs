@@ -1,8 +1,8 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use byteorder::{LittleEndian, ReadBytesExt};
+use getrandom::fill as getrandom_fill;
 
-use crate::crypto::hash;
 use crate::error::{NscbError, Result};
 use crate::formats::hfs0::Hfs0;
 use crate::formats::types;
@@ -224,15 +224,15 @@ impl XciBuilder {
     ) -> Vec<u8> {
         let mut header = Vec::with_capacity(XCI_HEADER_SIZE as usize);
 
-        // Placeholder signature block (NSCB uses random data here).
-        let mut sig_seed = Vec::new();
-        sig_seed.extend_from_slice(hfs0_hash);
-        sig_seed.extend_from_slice(&data_end.to_le_bytes());
-        let mut digest = hash::sha256(&sig_seed);
-        for _ in 0..(0x100 / 32) {
-            header.extend_from_slice(&digest);
-            digest = hash::sha256(&digest);
+        // Match squirrel.py get_xciheader(): the first 0x100 bytes are random.
+        let mut signature = [0u8; 0x100];
+        if getrandom_fill(&mut signature).is_err() {
+            // Keep a deterministic fallback if OS randomness is unavailable.
+            for (i, b) in signature.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(37).wrapping_add(0x5A);
+            }
         }
+        header.extend_from_slice(&signature);
 
         // "HEAD"
         header.extend_from_slice(b"HEAD");

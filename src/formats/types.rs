@@ -213,6 +213,10 @@ pub fn get_top_rsv(keygeneration: u8, rsv: u32) -> u32 {
         11 => 605_028_352,
         12 => 806_354_944,
         13 => 872_415_232,
+        14 => 939_524_096,
+        15 => 1_006_632_960,
+        16 => 1_073_741_824,
+        17 => 1_140_850_688,
         _ => rsv,
     }
 }
@@ -232,6 +236,11 @@ pub fn get_min_rsv(keygeneration: u8, rsv: u32) -> u32 {
         10 => 9 * 67_108_864,
         11 => 9 * 67_108_864 + 2 * 1_048_576,
         12 => 12 * 67_108_864 + 1 * 1_048_576,
+        13 => 13 * 67_108_864,
+        14 => 14 * 67_108_864,
+        15 => 15 * 67_108_864,
+        16 => 16 * 67_108_864,
+        17 => 17 * 67_108_864,
         _ => rsv,
     }
 }
@@ -253,5 +262,23 @@ pub fn apply_patcher_meta_rsv(keygeneration: u8, current_rsv: u32, requested_rsv
         }
     } else {
         current_rsv
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_patcher_meta_rsv, get_min_rsv};
+
+    #[test]
+    fn keygen_13_min_rsv_matches_13_0_0_floor() {
+        assert_eq!(get_min_rsv(13, 1_411_383_296), 872_415_232);
+    }
+
+    #[test]
+    fn rsv_cap_applies_for_keypatch_13() {
+        assert_eq!(
+            apply_patcher_meta_rsv(13, 1_411_383_296, 872_415_232),
+            872_415_232
+        );
     }
 }

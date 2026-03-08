@@ -1317,22 +1317,7 @@ fn python_fw_range_rsv(rsv: u32) -> String {
 }
 
 fn python_min_rsv(keygeneration: u8, rsv: u32) -> u32 {
-    match keygeneration {
-        0 => 0,
-        1 => 65_796,
-        2 => 3 * 67_108_864,
-        3 => 3 * 67_108_864 + 65_536,
-        4 => 4 * 67_108_864,
-        5 => 5 * 67_108_864,
-        6 => 6 * 67_108_864,
-        7 => 6 * 67_108_864 + 2 * 1_048_576,
-        8 => 7 * 67_108_864,
-        9 => 8 * 67_108_864 + 1_048_576,
-        10 => 9 * 67_108_864,
-        11 => 9 * 67_108_864 + 2 * 1_048_576,
-        12 => 12 * 67_108_864 + 1_048_576,
-        _ => rsv,
-    }
+    crate::formats::types::get_min_rsv(keygeneration, rsv)
 }
 
 fn python_cnmt_name(title_type: TitleType) -> &'static str {

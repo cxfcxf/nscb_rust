@@ -185,7 +185,13 @@ fn make_output_path(_input: &str, ofolder: &Option<String>, default_name: &str) 
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let safe_file_name = sanitize_output_filename(&file_name);
+    let mut safe_file_name = sanitize_output_filename(&file_name);
+    if file_name.contains("][") {
+        safe_file_name = Regex::new(r"\]\s+\[")
+            .unwrap()
+            .replace_all(&safe_file_name, "][")
+            .to_string();
+    }
 
     if let Some(dir) = ofolder {
         Path::new(dir)
@@ -327,7 +333,11 @@ fn sanitize_output_filename(name: &str) -> String {
 
 fn change_ext(path: &str, new_ext: &str) -> String {
     let p = Path::new(path);
-    p.with_extension(new_ext).to_string_lossy().into()
+    let renamed = p.with_extension(new_ext).to_string_lossy().to_string();
+    Regex::new(r"\]\s+\[")
+        .unwrap()
+        .replace_all(&renamed, "][")
+        .to_string()
 }
 
 fn compress_ext(path: &str) -> String {
@@ -938,7 +948,7 @@ fn python_title_spacing(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_merge_filename, sanitize_output_filename};
+    use super::{build_merge_filename, change_ext, make_output_path, sanitize_output_filename};
 
     #[test]
     fn merge_filename_counts_dlc_without_dlc_tag() {
@@ -978,6 +988,33 @@ mod tests {
         assert_eq!(
             out,
             "Hollow Knight Silksong [010013C00E930000].xci".to_string()
+        );
+    }
+
+    #[test]
+    fn direct_creation_change_ext_collapses_adjacent_tag_spacing() {
+        let out = change_ext(
+            "/tmp/UNICORN OVERLORD[010054B01AD92000] [HK] [v0].xci",
+            "nsp",
+        );
+        assert_eq!(
+            out,
+            "/tmp/UNICORN OVERLORD[010054B01AD92000][HK][v0].nsp"
+        );
+    }
+
+    #[test]
+    fn direct_creation_make_output_path_preserves_collapsed_tags() {
+        let default_name =
+            "/tmp/UNICORN OVERLORD[010054B01AD92000][HK][v0].nsp".to_string();
+        let out = make_output_path(
+            "/mnt/e/test/UNICORN OVERLORD[010054B01AD92000][HK][v0].xci",
+            &Some("/tmp/out".to_string()),
+            &default_name,
+        );
+        assert_eq!(
+            out,
+            "/tmp/out/UNICORN OVERLORD[010054B01AD92000][HK][v0].nsp"
         );
     }
 }

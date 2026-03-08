@@ -434,7 +434,7 @@ fn collect_from_xci(
         });
 
         if entry.name.ends_with(".cnmt.nca") {
-            maybe_add_generated_xml(
+            let _ = maybe_add_generated_xml(
                 &mut file,
                 entry.name.clone(),
                 entry.abs_offset,
@@ -446,7 +446,7 @@ fn collect_from_xci(
                 rsvcap,
                 keypatch,
                 print_version,
-            )?;
+            );
         }
     }
 
@@ -562,7 +562,16 @@ fn build_nsp_output(
                     Some(*nca)
                 };
                 if let Some(entry) = to_write {
-                    let mut src = BufReader::new(File::open(&entry.source_path)?);
+                    let src_file = File::open(&entry.source_path).map_err(|e| {
+                        NscbError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to open NCA source '{}' for '{}': {}",
+                                entry.source_path, entry.nca_name, e
+                            ),
+                        ))
+                    })?;
+                    let mut src = BufReader::new(src_file);
                     if effective_rsvcap.is_some() || keypatch.is_some() {
                         src.seek(SeekFrom::Start(entry.abs_offset))?;
                         let mut nca_bytes = vec![0u8; entry.size as usize];
@@ -612,11 +621,23 @@ fn build_nsp_output(
                 }
             }
             Item::Ticket(tik) => {
-                let mut src = BufReader::new(File::open(&tik.source_path)?);
+                let src_file = File::open(&tik.source_path).map_err(|e| {
+                    NscbError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to open ticket source '{}': {}", tik.source_path, e),
+                    ))
+                })?;
+                let mut src = BufReader::new(src_file);
                 uio::copy_section(&mut src, &mut out, tik.abs_offset, tik.size, Some(&pb))?;
             }
             Item::Cert(cert) => {
-                let mut src = BufReader::new(File::open(&cert.source_path)?);
+                let src_file = File::open(&cert.source_path).map_err(|e| {
+                    NscbError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to open cert source '{}': {}", cert.source_path, e),
+                    ))
+                })?;
+                let mut src = BufReader::new(src_file);
                 uio::copy_section(&mut src, &mut out, cert.abs_offset, cert.size, Some(&pb))?;
             }
             Item::Xml(xml) => {
@@ -627,7 +648,13 @@ fn build_nsp_output(
                     out.write_all(bytes)?;
                     pb.inc(bytes.len() as u64);
                 } else if let (Some(source_path), Some(abs_offset)) = (&xml.source_path, xml.abs_offset) {
-                    let mut src = BufReader::new(File::open(source_path)?);
+                    let src_file = File::open(source_path).map_err(|e| {
+                        NscbError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!("failed to open xml source '{}': {}", source_path, e),
+                        ))
+                    })?;
+                    let mut src = BufReader::new(src_file);
                     uio::copy_section(&mut src, &mut out, abs_offset, xml.size, Some(&pb))?;
                 }
             }
@@ -716,6 +743,35 @@ fn maybe_add_generated_xml(
         source_is_nsp_like,
     });
     Ok(())
+}
+
+pub(crate) fn generate_meta_xml_bytes(
+    file: &mut BufReader<File>,
+    meta_name: &str,
+    abs_offset: u64,
+    size: u64,
+    ks: &KeyStore,
+    rsvcap: Option<u32>,
+    keypatch: Option<u8>,
+    meta_hash_override: Option<&str>,
+) -> Result<Option<(String, Vec<u8>)>> {
+    if !meta_name.ends_with(".cnmt.nca") {
+        return Ok(None);
+    }
+    let Some((cnmt, digest, crypto2, keygen, nsha)) = parse_meta_xml_info(file, abs_offset, size, ks)? else {
+        return Ok(None);
+    };
+    let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
+    let mut cnmt = cnmt;
+    if let Some(cap) = effective_direct_multi_rsv_cap(rsvcap, keypatch) {
+        let before = cnmt.required_system_version;
+        let keygen_u8 = keypatch.unwrap_or(keygen);
+        let after = crate::formats::types::apply_patcher_meta_rsv(keygen_u8, before, cap);
+        cnmt.patch_required_system_version(after);
+    }
+    let meta_hash = meta_hash_override.unwrap_or(&nsha);
+    let xml = build_python_cnmt_xml(meta_name, size, &cnmt, &digest, crypto2, keygen, meta_hash);
+    Ok(Some((xml_name, xml.into_bytes())))
 }
 
 fn parse_meta_xml_info(
@@ -1062,14 +1118,30 @@ fn build_xci_output(
     let mut source_headers_by_path: HashMap<String, Vec<NcaHeader>> = HashMap::new();
 
     for nca in ncas {
-        let mut src = BufReader::new(File::open(&nca.source_path)?);
+        if !nca.source_is_nsp_like && effective_rsvcap.is_none() && keypatch.is_none() {
+            continue;
+        }
+        let mut src = BufReader::new(File::open(&nca.source_path).map_err(|e| {
+            NscbError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to open source '{}' while preparing XCI headers for '{}': {}",
+                    nca.source_path, nca.nca_name, e
+                ),
+            ))
+        })?);
         src.seek(SeekFrom::Start(nca.abs_offset))?;
         let mut enc_header = vec![0u8; 0xC00];
         src.read_exact(&mut enc_header)?;
         source_headers_by_path
             .entry(nca.source_path.clone())
             .or_default()
-            .push(NcaHeader::from_encrypted(&enc_header, ks)?);
+            .push(NcaHeader::from_encrypted(&enc_header, ks).map_err(|e| {
+                NscbError::InvalidData(format!(
+                    "failed to parse NCA header for '{}' from '{}' at offset {}: {}",
+                    nca.nca_name, nca.source_path, nca.abs_offset, e
+                ))
+            })?);
     }
     let source_is_cartridge: HashMap<String, bool> = source_headers_by_path
         .iter()
@@ -1087,11 +1159,35 @@ fn build_xci_output(
     // Build secure partition HFS0
     let mut secure_builder = Hfs0Builder::new();
     for nca in ncas {
-        let mut src = BufReader::new(File::open(&nca.source_path)?);
+        let mut src = BufReader::new(File::open(&nca.source_path).map_err(|e| {
+            NscbError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to open source '{}' while building XCI for '{}': {}",
+                    nca.source_path, nca.nca_name, e
+                ),
+            ))
+        })?);
         src.seek(SeekFrom::Start(nca.abs_offset))?;
         let mut enc_header = vec![0u8; 0xC00];
         src.read_exact(&mut enc_header)?;
-        let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
+        if !nca.source_is_nsp_like && effective_rsvcap.is_none() && keypatch.is_none() {
+            let hash = crate::crypto::hash::sha256(&enc_header[..0x200]);
+            secure_builder.add_file(nca.nca_name.clone(), nca.size, hash, 0x200);
+            prepared.push(PreparedNca {
+                source_path: nca.source_path.clone(),
+                abs_offset: nca.abs_offset,
+                size: nca.size,
+                patched_header: enc_header,
+            });
+            continue;
+        }
+        let parsed = NcaHeader::from_encrypted(&enc_header, ks).map_err(|e| {
+            NscbError::InvalidData(format!(
+                "failed to parse XCI build header for '{}' from '{}' at offset {}: {}",
+                nca.nca_name, nca.source_path, nca.abs_offset, e
+            ))
+        })?;
         let title_key = if parsed.has_rights_id() {
             if let Some(enc_title_key) = enc_title_keys_by_rights.get(&parsed.rights_id) {
                 let mkrev = parsed.key_generation().saturating_sub(1);
@@ -1158,7 +1254,9 @@ fn build_xci_output(
     }
 
     let secure_header = secure_builder.build_header_aligned(0x200);
-    let secure_total = secure_builder.total_size();
+    let secure_payload_total =
+        secure_header.len() as u64 + prepared.iter().map(|n| n.size).sum::<u64>();
+    let secure_total = crate::util::align::align_up(secure_payload_total, types::MEDIA_SIZE);
 
     // Build root HFS0 with gamecard-like partitions: update, normal, secure.
     let empty_partition = empty_hfs0_partition_0x200();
@@ -1252,6 +1350,12 @@ fn build_xci_output(
                 Some(&pb),
             )?;
         }
+    }
+
+    if secure_total > secure_payload_total {
+        let pad_len = (secure_total - secure_payload_total) as usize;
+        out.write_all(&vec![0u8; pad_len])?;
+        pb.inc(pad_len as u64);
     }
 
     out.flush()?;

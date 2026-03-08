@@ -188,7 +188,9 @@ fn write_group_as_xci(
     }
 
     let secure_header = secure_builder.build_header_aligned(0x200);
-    let secure_total = secure_builder.total_size();
+    let secure_payload_total =
+        secure_header.len() as u64 + prepared.iter().map(|n| n.size).sum::<u64>();
+    let secure_total = crate::util::align::align_up(secure_payload_total, types::MEDIA_SIZE);
     let empty_partition = empty_hfs0_partition_0x200();
     let empty_hash = crate::crypto::hash::sha256(&empty_partition);
     let secure_hash = crate::crypto::hash::sha256(&secure_header);
@@ -249,6 +251,12 @@ fn write_group_as_xci(
                 Some(&pb),
             )?;
         }
+    }
+
+    if secure_total > secure_payload_total {
+        let pad_len = (secure_total - secure_payload_total) as usize;
+        out.write_all(&vec![0u8; pad_len])?;
+        pb.inc(pad_len as u64);
     }
 
     out.flush()?;

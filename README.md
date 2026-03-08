@@ -221,6 +221,28 @@ Use the included parity runner to compare Rust outputs against NSC_BUILDER Pytho
 
 The Rust binary never delegates to `squirrel.py`. The Python reference is only used by the parity harness for comparison.
 
+### Python Reference Setup
+
+The parity runner expects a local NSC_BUILDER checkout plus a Python virtualenv:
+
+```bash
+mkdir -p .qa_suite/reference
+git clone https://github.com/cxcfxf/NSC_BUILDER .qa_suite/reference/NSC_BUILDER
+python3 -m venv .qa_suite/reference/NSC_BUILDER/.venv
+.qa_suite/reference/NSC_BUILDER/.venv/bin/pip install --upgrade pip setuptools wheel
+.qa_suite/reference/NSC_BUILDER/.venv/bin/pip install pycryptodome tqdm zstandard eel bottle bottle-websocket pywebview
+```
+
+Expected layout:
+
+```bash
+$PWD/.qa_suite/reference/NSC_BUILDER
+├── .venv/
+└── py/ztools/
+```
+
+If you keep the Python reference tree there, `run_parity_exact.sh` works without extra env vars.
+
 Common env vars:
 
 - `TEST_DIR`: folder containing test inputs and `prod.keys`
@@ -232,19 +254,20 @@ Common env vars:
 - `PY_ZTOOLS`: override `py/ztools` inside the Python reference tree
 - `PYTHON_BIN`: override the Python interpreter used for parity runs
 
+### Intentional Differences
+
+The suite is parity-first, but these differences are intentional and documented:
+
+- `ADVfilelist` line `Patchable to:` is not parity-gated for higher key generations.
+  Rust uses the extended RSV floor table so firmware downgrade reporting stays consistent with actual merge behavior. The Python reference falls back incorrectly for higher keygens.
+- Raw compressed `.nsz` / `.xcz` bytes are not parity-gated.
+  The suite enforces decompressed payload parity and filename parity instead.
+- XCI files ignore the first `0x100` bytes for exact byte comparison.
+  Python randomizes the XCI signature block on each run, and Rust intentionally mimics that behavior.
+
 Compression note:
 - decompressed payload parity is enforced
 - compressed `.nsz` / `.xcz` byte streams are not required to match Python bit-for-bit
-
-Default reference layout:
-
-```bash
-$PWD/.qa_suite/reference/NSC_BUILDER
-├── .venv/
-└── py/ztools/
-```
-
-If you keep the Python reference tree there, no extra env vars are required.
 
 Example (`E:\dumps\game_set` on WSL as `/mnt/e/dumps/game_set`):
 

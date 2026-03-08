@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 use crate::error::{NscbError, Result};
 use crate::formats::hfs0::Hfs0Builder;
 use crate::formats::nca::NcaHeader;
@@ -71,8 +73,20 @@ fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> 
         patched_header: Vec<u8>,
     }
     let mut prepared = Vec::with_capacity(nca_entries.len());
+    let mut source_headers = Vec::with_capacity(nca_entries.len());
 
     // Build secure HFS0
+    for entry in &nca_entries {
+        let abs_offset = nsp.file_abs_offset(entry);
+        file.seek(SeekFrom::Start(abs_offset))?;
+        let mut enc_header = vec![0u8; 0xC00];
+        file.read_exact(&mut enc_header)?;
+
+        let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
+        source_headers.push(parsed.clone());
+    }
+    let source_is_cartridge = crate::formats::nca::python_xci_is_cartridge(&source_headers, ks);
+
     let mut secure_builder = Hfs0Builder::new();
     for entry in &nca_entries {
         let abs_offset = nsp.file_abs_offset(entry);
@@ -91,12 +105,14 @@ fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> 
         } else {
             None
         };
+        let gc_flag =
+            crate::formats::nca::python_xci_gamecard_flag(&parsed, ks, source_is_cartridge);
         let patched_header =
             crate::formats::nca::rewrite_header_for_xci(
                 &enc_header,
                 ks,
                 title_key,
-                parsed.distribution_type,
+                gc_flag,
             )?;
         let hash = crate::crypto::hash::sha256(&patched_header[..0x200]);
         secure_builder.add_file(entry.name.clone(), entry.size, hash, 0x200);
@@ -108,7 +124,8 @@ fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> 
     }
 
     let secure_header = secure_builder.build_header_aligned(0x200);
-    let secure_total = secure_builder.total_size();
+    let secure_payload_total = secure_builder.total_size();
+    let secure_total = crate::util::align::align_up(secure_payload_total, types::MEDIA_SIZE);
 
     // Build root HFS0 with gamecard-like partitions: update, normal, secure.
     let empty_partition = empty_hfs0_partition_0x200();
@@ -193,6 +210,13 @@ fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> 
         }
     }
 
+    let written_secure = secure_header.len() as u64 + prepared.iter().map(|n| n.size).sum::<u64>();
+    if secure_total > written_secure {
+        let pad_len = (secure_total - written_secure) as usize;
+        out.write_all(&vec![0u8; pad_len])?;
+        pb.inc(pad_len as u64);
+    }
+
     out.flush()?;
     pb.finish_with_message("Done");
     println!("Written: {}", output_path);
@@ -222,10 +246,47 @@ fn xci_to_nsp(input_path: &str, output_path: &str, _ks: &KeyStore) -> Result<()>
         ));
     }
 
-    // Build NSP PFS0
+    struct PreparedEntry {
+        name: String,
+        size: u64,
+        abs_offset: u64,
+        patched_header: Vec<u8>,
+        xml: Option<(String, Vec<u8>)>,
+    }
+    let mut prepared = Vec::with_capacity(secure_entries.len());
+
     let mut builder = Pfs0Builder::new();
     for entry in &secure_entries {
+        file.seek(SeekFrom::Start(entry.abs_offset))?;
+        let mut enc_header = vec![0u8; 0xC00];
+        file.read_exact(&mut enc_header)?;
+        let patched_header = crate::formats::nca::rewrite_header_for_nsp(&enc_header, _ks)?;
+        let meta_hash = if entry.name.ends_with(".cnmt.nca") {
+            Some(hash_patched_nca(&mut file, entry.abs_offset, entry.size, &patched_header)?)
+        } else {
+            None
+        };
+        let xml = crate::ops::merge::generate_meta_xml_bytes(
+            &mut file,
+            &entry.name,
+            entry.abs_offset,
+            entry.size,
+            _ks,
+            None,
+            None,
+            meta_hash.as_deref(),
+        )?;
         builder.add_file(entry.name.clone(), entry.size);
+        if let Some((ref xml_name, ref xml_bytes)) = xml {
+            builder.add_file(xml_name.clone(), xml_bytes.len() as u64);
+        }
+        prepared.push(PreparedEntry {
+            name: entry.name.clone(),
+            size: entry.size,
+            abs_offset: entry.abs_offset,
+            patched_header,
+            xml,
+        });
     }
 
     let header = builder.build_header();
@@ -237,12 +298,50 @@ fn xci_to_nsp(input_path: &str, output_path: &str, _ks: &KeyStore) -> Result<()>
     out.write_all(&header)?;
     pb.set_position(header.len() as u64);
 
-    for entry in &secure_entries {
-        uio::copy_section(&mut file, &mut out, entry.abs_offset, entry.size, Some(&pb))?;
+    for entry in &prepared {
+        out.write_all(&entry.patched_header)?;
+        pb.inc(entry.patched_header.len() as u64);
+
+        if entry.size > entry.patched_header.len() as u64 {
+            uio::copy_section(
+                &mut file,
+                &mut out,
+                entry.abs_offset + entry.patched_header.len() as u64,
+                entry.size - entry.patched_header.len() as u64,
+                Some(&pb),
+            )?;
+        }
+
+        if let Some((_xml_name, xml_bytes)) = &entry.xml {
+            out.write_all(xml_bytes)?;
+            pb.inc(xml_bytes.len() as u64);
+        }
     }
 
     out.flush()?;
     pb.finish_with_message("Done");
     println!("Written: {}", output_path);
     Ok(())
+}
+
+fn hash_patched_nca(
+    file: &mut BufReader<File>,
+    abs_offset: u64,
+    size: u64,
+    patched_header: &[u8],
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(patched_header);
+    let mut remaining = size.saturating_sub(patched_header.len() as u64);
+    let mut offset = abs_offset + patched_header.len() as u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len() as u64) as usize;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut buf[..to_read])?;
+        hasher.update(&buf[..to_read]);
+        remaining -= to_read as u64;
+        offset += to_read as u64;
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
