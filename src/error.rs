@@ -22,6 +22,12 @@ pub enum NscbError {
 
     #[error("Invalid data: {0}")]
     InvalidData(String),
+
+    #[error("HTTP error: {0}")]
+    Http(String),
+
+    #[error("JSON error: {0}")]
+    Json(String),
 }
 
 pub type Result<T> = std::result::Result<T, NscbError>;

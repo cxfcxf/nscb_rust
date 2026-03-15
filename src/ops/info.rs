@@ -30,6 +30,16 @@ pub fn file_list(path: &str, ks: &KeyStore) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn control_language_tag(path: &str, ks: &KeyStore) -> Option<String> {
+    let report = build_report(path, ks).ok()?;
+    let title = report
+        .titles
+        .iter()
+        .find(|title| matches!(title.title_type, TitleType::Application | TitleType::Patch))
+        .or_else(|| report.titles.first())?;
+    python_language_tag_from_labels(&title.control.languages)
+}
+
 #[derive(Clone)]
 struct Report {
     titles: Vec<TitleReport>,
@@ -125,7 +135,9 @@ fn build_report_from_groups<R: Read + Seek>(
         });
         let base_id = match title_type {
             TitleType::Application => cnmt.title_id,
-            TitleType::Patch | TitleType::AddOnContent | TitleType::Delta => cnmt.application_title_id,
+            TitleType::Patch | TitleType::AddOnContent | TitleType::Delta => {
+                cnmt.application_title_id
+            }
             _ => cnmt.title_id,
         };
 
@@ -193,6 +205,59 @@ fn build_report_from_groups<R: Read + Seek>(
     Ok(Report { titles })
 }
 
+fn python_language_tag_from_labels(labels: &[&'static str]) -> Option<String> {
+    if labels.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from("(");
+    if labels.contains(&"US (eng)") || labels.contains(&"UK (eng)") {
+        out.push_str("En,");
+    }
+    if labels.contains(&"JP") {
+        out.push_str("Jp,");
+    }
+    if labels.contains(&"CAD (fr)") || labels.contains(&"FR") {
+        out.push_str("Fr,");
+    }
+    if labels.contains(&"DE") {
+        out.push_str("De,");
+    }
+    if labels.contains(&"LAT (spa)") && labels.contains(&"SPA") {
+        out.push_str("Es,");
+    } else if labels.contains(&"LAT (spa)") {
+        out.push_str("LatEs,");
+    } else if labels.contains(&"SPA") {
+        out.push_str("Es,");
+    }
+    if labels.contains(&"IT") {
+        out.push_str("It,");
+    }
+    if labels.contains(&"DU") {
+        out.push_str("Du,");
+    }
+    if labels.contains(&"POR") {
+        out.push_str("Por,");
+    }
+    if labels.contains(&"RU") {
+        out.push_str("Ru,");
+    }
+    if labels.contains(&"KOR") {
+        out.push_str("Kor,");
+    }
+    if labels.contains(&"CH") || labels.contains(&"TW (ch)") {
+        out.push_str("Ch,");
+    }
+
+    if out == "(" {
+        None
+    } else {
+        out.pop();
+        out.push(')');
+        Some(out)
+    }
+}
+
 fn analyze_group<R: Read + Seek>(
     reader: &mut R,
     group: &crate::ops::split::TitleGroup,
@@ -221,7 +286,8 @@ fn analyze_group<R: Read + Seek>(
             continue;
         }
 
-        let info = match nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks) {
+        let info = match nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks)
+        {
             Ok(info) => info,
             Err(_) => continue,
         };
@@ -253,24 +319,23 @@ fn analyze_group<R: Read + Seek>(
                 }
             }
             Some(ContentType::Control) => {
-                let title_key = if let Ok(header) = NcaHeader::from_reader(reader, entry.abs_offset, ks) {
-                    title_keys_by_rights.get(&header.rights_id).copied()
-                } else {
-                    None
-                };
+                let title_key =
+                    if let Ok(header) = NcaHeader::from_reader(reader, entry.abs_offset, ks) {
+                        title_keys_by_rights.get(&header.rights_id).copied()
+                    } else {
+                        None
+                    };
                 if analysis.control.is_none() {
                     let mut control =
                         read_control_info(reader, entry.abs_offset, ks, title_key.as_ref())
                             .unwrap_or_default();
                     if control.display_version.is_empty() || control.display_version == "-" {
-                        if let Some(display_version) =
-                            read_control_display_version(
-                                reader,
-                                entry.abs_offset,
-                                ks,
-                                title_key.as_ref(),
-                            )
-                        {
+                        if let Some(display_version) = read_control_display_version(
+                            reader,
+                            entry.abs_offset,
+                            ks,
+                            title_key.as_ref(),
+                        ) {
                             control.display_version = display_version;
                         }
                     }
@@ -306,7 +371,8 @@ fn apply_nsp_cnmt_xml_overrides<R: Read + Seek>(
     }
 
     for title in &mut report.titles {
-        let xml_name = format!("{}.xml", title.meta_name.trim_end_matches(".nca")).to_ascii_lowercase();
+        let xml_name =
+            format!("{}.xml", title.meta_name.trim_end_matches(".nca")).to_ascii_lowercase();
         if let Some(rsv) = overrides.get(&xml_name) {
             title.required_system_version = *rsv;
         }
@@ -354,11 +420,18 @@ fn build_adv_content_text(report: &Report) -> String {
                 &mut out,
                 &format!("Name: {}", python_spacing(&base_title.control.title)),
             );
-            push_line(&mut out, &format!("Editor: {}", base_title.control.publisher));
+            push_line(
+                &mut out,
+                &format!("Editor: {}", base_title.control.publisher),
+            );
             push_line(&mut out, "------------------------------------------------");
             push_line(
                 &mut out,
-                &format!("{} [BASE] v{}", lower_tid(base_title.title_id), base_title.version),
+                &format!(
+                    "{} [BASE] v{}",
+                    lower_tid(base_title.title_id),
+                    base_title.version
+                ),
             );
             for update in &updates {
                 push_line(
@@ -404,12 +477,18 @@ fn build_adv_file_text(report: &Report) -> String {
 
     for title in &report.titles {
         push_line(&mut out, "-----------------------------");
-        push_line(&mut out, &format!("CONTENT ID: {}", lower_tid(title.title_id)));
+        push_line(
+            &mut out,
+            &format!("CONTENT ID: {}", lower_tid(title.title_id)),
+        );
         push_line(&mut out, "-----------------------------");
 
         if title.title_type == TitleType::AddOnContent {
             if !title.control.title.is_empty() {
-                push_line(&mut out, &format!("- Name: {}", python_spacing(&title.control.title)));
+                push_line(
+                    &mut out,
+                    &format!("- Name: {}", python_spacing(&title.control.title)),
+                );
                 push_line(&mut out, &format!("- Editor: {}", title.control.publisher));
             }
             push_line(&mut out, "- Content type: DLC");
@@ -426,34 +505,55 @@ fn build_adv_file_text(report: &Report) -> String {
                     title.version / 65_536
                 ),
             );
-            push_line(&mut out, &format!("- Meta SDK version: {}", title.meta_sdk_version));
-            push_line(&mut out, &format!("- Data SDK version: {}", title.content_sdk_version));
+            push_line(
+                &mut out,
+                &format!("- Meta SDK version: {}", title.meta_sdk_version),
+            );
+            push_line(
+                &mut out,
+                &format!("- Data SDK version: {}", title.content_sdk_version),
+            );
             if !title.control.languages.is_empty() {
                 push_line(
                     &mut out,
-                    &format!("- Supported Languages: {}", title.control.languages.join(", ")),
+                    &format!(
+                        "- Supported Languages: {}",
+                        title.control.languages.join(", ")
+                    ),
                 );
             }
         } else {
             push_line(&mut out, "Titleinfo:");
-            push_line(&mut out, &format!("- Name: {}", python_spacing(&title.control.title)));
+            push_line(
+                &mut out,
+                &format!("- Name: {}", python_spacing(&title.control.title)),
+            );
             push_line(&mut out, &format!("- Editor: {}", title.control.publisher));
             push_line(
                 &mut out,
                 &format!("- Display Version: {}", title.control.display_version),
             );
-            push_line(&mut out, &format!("- Meta SDK version: {}", title.meta_sdk_version));
+            push_line(
+                &mut out,
+                &format!("- Meta SDK version: {}", title.meta_sdk_version),
+            );
             push_line(
                 &mut out,
                 &format!("- Program SDK version: {}", title.content_sdk_version),
             );
             push_line(
                 &mut out,
-                &format!("- Supported Languages: {}", title.control.languages.join(", ")),
+                &format!(
+                    "- Supported Languages: {}",
+                    title.control.languages.join(", ")
+                ),
             );
             push_line(
                 &mut out,
-                &format!("- Content type: {}", python_content_type_label(title.title_type)),
+                &format!(
+                    "- Content type: {}",
+                    python_content_type_label(title.title_type)
+                ),
             );
             push_line(
                 &mut out,
@@ -514,7 +614,11 @@ fn build_adv_file_text(report: &Report) -> String {
         push_line(&mut out, "NCA FILES (NON DELTAS)");
         push_line(&mut out, "......................");
         let mut total_non_delta = 0u64;
-        for entry in title.content_entries.iter().filter(|entry| entry.ncatype != 6) {
+        for entry in title
+            .content_entries
+            .iter()
+            .filter(|entry| entry.ncatype != 6)
+        {
             push_line(&mut out, &python_nca_line(entry));
             total_non_delta += entry.size;
         }
@@ -530,7 +634,10 @@ fn build_adv_file_text(report: &Report) -> String {
         push_line(&mut out, "\t\t\t\t\t\t\t  --------------------");
         push_line(
             &mut out,
-            &format!("\t\t\t\t\t\t\t  TOTAL SIZE: {}", python_size(total_non_delta)),
+            &format!(
+                "\t\t\t\t\t\t\t  TOTAL SIZE: {}",
+                python_size(total_non_delta)
+            ),
         );
 
         let full_total = total_non_delta;
@@ -745,7 +852,11 @@ fn parse_control_nca_section(section_data: &[u8]) -> Option<ControlInfo> {
         if title.is_empty() {
             continue;
         }
-        let final_title = if title.is_empty() { "DLC".to_string() } else { title };
+        let final_title = if title.is_empty() {
+            "DLC".to_string()
+        } else {
+            title
+        };
         return Some(ControlInfo {
             title: final_title,
             publisher: editor,
@@ -776,7 +887,8 @@ fn extract_nacp_from_romfs(section_data: &[u8]) -> Option<Vec<u8>> {
     let data_offset = u64::from_le_bytes(romfs.get(0x48..0x50)?.try_into().ok()?) as usize;
 
     let dir_table = romfs.get(dir_table_offset..dir_table_offset.checked_add(dir_table_size)?)?;
-    let file_table = romfs.get(file_table_offset..file_table_offset.checked_add(file_table_size)?)?;
+    let file_table =
+        romfs.get(file_table_offset..file_table_offset.checked_add(file_table_size)?)?;
 
     extract_nacp_from_romfs_dir(romfs, dir_table, file_table, data_offset, 0)
 }
@@ -792,8 +904,16 @@ fn extract_nacp_from_romfs_dir(
         return None;
     }
 
-    let child_dir = u32::from_le_bytes(dir_table[dir_offset + 0x8..dir_offset + 0xC].try_into().ok()?);
-    let first_file = u32::from_le_bytes(dir_table[dir_offset + 0xC..dir_offset + 0x10].try_into().ok()?);
+    let child_dir = u32::from_le_bytes(
+        dir_table[dir_offset + 0x8..dir_offset + 0xC]
+            .try_into()
+            .ok()?,
+    );
+    let first_file = u32::from_le_bytes(
+        dir_table[dir_offset + 0xC..dir_offset + 0x10]
+            .try_into()
+            .ok()?,
+    );
 
     let mut file_offset = first_file;
     while file_offset != 0xFFFF_FFFF {
@@ -802,9 +922,11 @@ fn extract_nacp_from_romfs_dir(
             break;
         }
         let sibling = u32::from_le_bytes(file_table[off + 0x4..off + 0x8].try_into().ok()?);
-        let data_rel = u64::from_le_bytes(file_table[off + 0x8..off + 0x10].try_into().ok()?) as usize;
+        let data_rel =
+            u64::from_le_bytes(file_table[off + 0x8..off + 0x10].try_into().ok()?) as usize;
         let size = u64::from_le_bytes(file_table[off + 0x10..off + 0x18].try_into().ok()?) as usize;
-        let name_len = u32::from_le_bytes(file_table[off + 0x1C..off + 0x20].try_into().ok()?) as usize;
+        let name_len =
+            u32::from_le_bytes(file_table[off + 0x1C..off + 0x20].try_into().ok()?) as usize;
         let name_end = off + 0x20 + name_len;
         if name_end > file_table.len() {
             break;
@@ -824,7 +946,9 @@ fn extract_nacp_from_romfs_dir(
         if off + 0x18 > dir_table.len() {
             break;
         }
-        if let Some(nacp) = extract_nacp_from_romfs_dir(romfs, dir_table, file_table, data_offset, off) {
+        if let Some(nacp) =
+            extract_nacp_from_romfs_dir(romfs, dir_table, file_table, data_offset, off)
+        {
             return Some(nacp);
         }
         next_dir = u32::from_le_bytes(dir_table[off + 0x4..off + 0x8].try_into().ok()?);
@@ -892,14 +1016,20 @@ fn parse_nacp_info_at(bytes: &[u8], base_offset: usize) -> Option<ControlInfo> {
         }
         let raw_title = &bytes[start..start + TITLE_SIZE];
         let raw_publisher = &bytes[start + TITLE_SIZE..start + TITLE_SIZE + PUBLISHER_SIZE];
-        let title_end = raw_title.iter().position(|b| *b == 0).unwrap_or(raw_title.len());
+        let title_end = raw_title
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(raw_title.len());
         let publisher_end = raw_publisher
             .iter()
             .position(|b| *b == 0)
             .unwrap_or(raw_publisher.len());
-        let current_title = String::from_utf8_lossy(&raw_title[..title_end]).trim().to_string();
-        let current_publisher =
-            String::from_utf8_lossy(&raw_publisher[..publisher_end]).trim().to_string();
+        let current_title = String::from_utf8_lossy(&raw_title[..title_end])
+            .trim()
+            .to_string();
+        let current_publisher = String::from_utf8_lossy(&raw_publisher[..publisher_end])
+            .trim()
+            .to_string();
         if !current_title.is_empty() {
             if title.is_empty() {
                 title = current_title;
@@ -911,7 +1041,8 @@ fn parse_nacp_info_at(bytes: &[u8], base_offset: usize) -> Option<ControlInfo> {
 
     if languages.is_empty() {
         let lang_mask = u32::from_le_bytes(
-            bytes[base_offset + SUPPORTED_LANGUAGE_OFFSET..base_offset + SUPPORTED_LANGUAGE_OFFSET + 4]
+            bytes[base_offset + SUPPORTED_LANGUAGE_OFFSET
+                ..base_offset + SUPPORTED_LANGUAGE_OFFSET + 4]
                 .try_into()
                 .ok()?,
         );
@@ -931,9 +1062,11 @@ fn parse_nacp_info_at(bytes: &[u8], base_offset: usize) -> Option<ControlInfo> {
     Some(ControlInfo {
         title,
         publisher,
-        display_version: String::from_utf8_lossy(&bytes[display_start..display_start + display_end])
-            .trim()
-            .to_string(),
+        display_version: String::from_utf8_lossy(
+            &bytes[display_start..display_start + display_end],
+        )
+        .trim()
+        .to_string(),
         languages,
     })
 }
@@ -1354,9 +1487,19 @@ fn python_nca_line(entry: &ContentEntryReport) -> String {
         _ => "Data: ",
     };
     if label == "Meta: " {
-        format!("- {}\t{}\tSize: {}", label, entry.name, python_size(entry.size))
+        format!(
+            "- {}\t{}\tSize: {}",
+            label,
+            entry.name,
+            python_size(entry.size)
+        )
     } else {
-        format!("- {}\t{}\t\tSize: {}", label, entry.name, python_size(entry.size))
+        format!(
+            "- {}\t{}\t\tSize: {}",
+            label,
+            entry.name,
+            python_size(entry.size)
+        )
     }
 }
 
@@ -1391,17 +1534,30 @@ fn build_python_xml_string(title: &TitleReport) -> String {
             entry.name.trim_end_matches(".nca").trim_end_matches(".ncz")
         ));
         xml.push_str(&format!("    <Size>{}</Size>\n", entry.size));
-        xml.push_str("    <Hash>0000000000000000000000000000000000000000000000000000000000000000</Hash>\n");
-        xml.push_str(&format!("    <KeyGeneration>{}</KeyGeneration>\n", title.key_generation));
+        xml.push_str(
+            "    <Hash>0000000000000000000000000000000000000000000000000000000000000000</Hash>\n",
+        );
+        xml.push_str(&format!(
+            "    <KeyGeneration>{}</KeyGeneration>\n",
+            title.key_generation
+        ));
         xml.push_str("  </Content>\n");
     }
-    xml.push_str("  <Digest>0000000000000000000000000000000000000000000000000000000000000000</Digest>\n");
-    xml.push_str(&format!("  <KeyGeneration>{}</KeyGeneration>\n", title.key_generation));
+    xml.push_str(
+        "  <Digest>0000000000000000000000000000000000000000000000000000000000000000</Digest>\n",
+    );
+    xml.push_str(&format!(
+        "  <KeyGeneration>{}</KeyGeneration>\n",
+        title.key_generation
+    ));
     xml.push_str(&format!(
         "  <RequiredSystemVersion>{}</RequiredSystemVersion>\n",
         title.required_system_version
     ));
-    xml.push_str(&format!("  <OriginalId>0x{:016x}</OriginalId>\n", title.base_id));
+    xml.push_str(&format!(
+        "  <OriginalId>0x{:016x}</OriginalId>\n",
+        title.base_id
+    ));
     xml.push_str("</ContentMeta>");
     xml
 }

@@ -142,7 +142,9 @@ pub(crate) fn split_output_name(
             let v = version.unwrap_or(0);
             format!("{} [{}][v{}][DLC].nsp", base_name, tid, v)
         }
-        Some(TitleType::Application) => format!("{} [{}] [v{}].nsp", base_name, tid, version.unwrap_or(0)),
+        Some(TitleType::Application) => {
+            format!("{} [{}] [v{}].nsp", base_name, tid, version.unwrap_or(0))
+        }
         _ => {
             let is_update = (group_id & 0xFFF) == 0x800;
             let is_base = (group_id & 0xFFF) == 0x000;
@@ -194,7 +196,11 @@ fn infer_game_name_from_input(input_path: &str) -> String {
     }
 }
 
-fn infer_game_name_from_nsp<R: Read + Seek>(nsp: &Nsp, reader: &mut R, ks: &KeyStore) -> Option<String> {
+fn infer_game_name_from_nsp<R: Read + Seek>(
+    nsp: &Nsp,
+    reader: &mut R,
+    ks: &KeyStore,
+) -> Option<String> {
     for entry in nsp.nca_entries() {
         let abs_offset = nsp.file_abs_offset(entry);
         if let Ok(info) = nca::parse_nca_info(reader, abs_offset, entry.size, &entry.name, ks) {
@@ -260,9 +266,11 @@ fn infer_game_name_from_xci<R: Read + Seek>(
     ks: &KeyStore,
 ) -> Option<String> {
     for entry in secure_entries {
-        if let Ok(info) = nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks) {
+        if let Ok(info) = nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks)
+        {
             if info.content_type == Some(crate::formats::types::ContentType::Control) {
-                if let Some(name) = parse_nacp_title_from_control_nca(reader, entry.abs_offset, ks) {
+                if let Some(name) = parse_nacp_title_from_control_nca(reader, entry.abs_offset, ks)
+                {
                     return Some(name);
                 }
             }
@@ -278,8 +286,8 @@ pub(crate) fn group_nsp_entries<R: Read + Seek>(
     ks: &KeyStore,
 ) -> Result<Vec<TitleGroup>> {
     let known_title_ids = collect_title_ids_from_ticket_names(nsp);
-    let base_name =
-        infer_game_name_from_nsp(nsp, reader, ks).unwrap_or_else(|| infer_game_name_from_input(input_path));
+    let base_name = infer_game_name_from_nsp(nsp, reader, ks)
+        .unwrap_or_else(|| infer_game_name_from_input(input_path));
     let guessed_version = infer_version_from_input(input_path);
     let (groups, group_meta) = build_nsp_group_map(nsp, reader, ks, &known_title_ids);
     let mut result = groups
@@ -312,7 +320,10 @@ pub(crate) fn group_nsp_entries<R: Read + Seek>(
             }
             TitleGroup {
                 title_id,
-                version: group_meta.get(&title_id).map(|meta| meta.version).or(guessed_version),
+                version: group_meta
+                    .get(&title_id)
+                    .map(|meta| meta.version)
+                    .or(guessed_version),
                 title_type: group_meta.get(&title_id).and_then(|meta| meta.title_type),
                 game_name: base_name.clone(),
                 entries: items,
@@ -364,7 +375,10 @@ pub(crate) fn group_xci_entries<R: Read + Seek>(
     Ok(result)
 }
 
-fn infer_meta_from_title_id(title_id: u64, guessed_version: Option<u32>) -> Option<(u32, Option<TitleType>)> {
+fn infer_meta_from_title_id(
+    title_id: u64,
+    guessed_version: Option<u32>,
+) -> Option<(u32, Option<TitleType>)> {
     let suffix = title_id & 0xFFF;
     if suffix == 0x800 {
         Some((guessed_version.unwrap_or(0), Some(TitleType::Patch)))
@@ -380,7 +394,10 @@ fn build_nsp_group_map<'a, R: Read + Seek>(
     reader: &mut R,
     ks: &KeyStore,
     known_title_ids: &std::collections::HashSet<u64>,
-) -> (HashMap<u64, Vec<&'a Pfs0Entry>>, HashMap<u64, SplitGroupMeta>) {
+) -> (
+    HashMap<u64, Vec<&'a Pfs0Entry>>,
+    HashMap<u64, SplitGroupMeta>,
+) {
     let cnmt_ncas = nsp.cnmt_nca_entries(reader, ks);
     let mut cnmt_nca_map: HashMap<String, u64> = HashMap::new();
     let mut group_meta: HashMap<u64, SplitGroupMeta> = HashMap::new();
@@ -413,7 +430,8 @@ fn build_nsp_group_map<'a, R: Read + Seek>(
             || entry.name.to_ascii_lowercase().ends_with(".ncz")
         {
             let abs_offset = nsp.file_abs_offset(entry);
-            if let Ok(header) = crate::formats::nca::NcaHeader::from_reader(reader, abs_offset, ks) {
+            if let Ok(header) = crate::formats::nca::NcaHeader::from_reader(reader, abs_offset, ks)
+            {
                 let mut group_id = header.title_id;
                 if header.has_rights_id() {
                     let rights_tid = u64::from_be_bytes(header.rights_id[..8].try_into().unwrap());
@@ -422,7 +440,9 @@ fn build_nsp_group_map<'a, R: Read + Seek>(
                     }
                 }
                 groups.entry(group_id).or_default().push(entry);
-            } else if let Ok(info) = nca::parse_nca_info(reader, abs_offset, entry.size, &entry.name, ks) {
+            } else if let Ok(info) =
+                nca::parse_nca_info(reader, abs_offset, entry.size, &entry.name, ks)
+            {
                 groups.entry(info.title_id).or_default().push(entry);
             }
         }
@@ -441,7 +461,8 @@ fn build_xci_group_map<'a, R: Read + Seek>(
     let mut cnmt_nca_map: HashMap<String, u64> = HashMap::new();
     let mut group_meta: HashMap<u64, SplitGroupMeta> = HashMap::new();
     for entry in secure_entries {
-        if let Ok(info) = nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks) {
+        if let Ok(info) = nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks)
+        {
             if info.content_type == Some(crate::formats::types::ContentType::Meta) {
                 if let Some(cnmt) = parse_cnmt_from_meta_nca(reader, entry.abs_offset, ks) {
                     let group_id = cnmt.title_id;
@@ -466,7 +487,9 @@ fn build_xci_group_map<'a, R: Read + Seek>(
         let mut meta_positions: Vec<(usize, u64)> = Vec::new();
         for (idx, entry) in secure_entries.iter().enumerate() {
             if entry.name.to_ascii_lowercase().ends_with(".cnmt.nca") {
-                if let Ok(header) = crate::formats::nca::NcaHeader::from_reader(reader, entry.abs_offset, ks) {
+                if let Ok(header) =
+                    crate::formats::nca::NcaHeader::from_reader(reader, entry.abs_offset, ks)
+                {
                     meta_positions.push((idx, header.title_id));
                 }
             }
@@ -476,8 +499,15 @@ fn build_xci_group_map<'a, R: Read + Seek>(
                 let (m0, t0) = meta_positions[0];
                 let (m1, t1) = meta_positions[1];
                 let mut update_start = m1;
-                for (idx, entry) in secure_entries.iter().enumerate().skip(m0 + 1).take(m1.saturating_sub(m0 + 1)) {
-                    if let Ok(info) = nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks) {
+                for (idx, entry) in secure_entries
+                    .iter()
+                    .enumerate()
+                    .skip(m0 + 1)
+                    .take(m1.saturating_sub(m0 + 1))
+                {
+                    if let Ok(info) =
+                        nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks)
+                    {
                         if info.content_type == Some(crate::formats::types::ContentType::Program) {
                             update_start = idx;
                             break;
@@ -507,8 +537,11 @@ fn build_xci_group_map<'a, R: Read + Seek>(
         }
     } else {
         for entry in secure_entries {
-            let nca_id = nca_id_from_filename(&entry.name).unwrap_or_else(|| entry.name.to_lowercase());
-            if let Ok(header) = crate::formats::nca::NcaHeader::from_reader(reader, entry.abs_offset, ks) {
+            let nca_id =
+                nca_id_from_filename(&entry.name).unwrap_or_else(|| entry.name.to_lowercase());
+            if let Ok(header) =
+                crate::formats::nca::NcaHeader::from_reader(reader, entry.abs_offset, ks)
+            {
                 if let Some(&group_id) = cnmt_nca_map.get(&nca_id) {
                     groups.entry(group_id).or_default().push(entry);
                     continue;
@@ -523,7 +556,9 @@ fn build_xci_group_map<'a, R: Read + Seek>(
                 groups.entry(group_id).or_default().push(entry);
             } else if let Some(&group_id) = cnmt_nca_map.get(&nca_id) {
                 groups.entry(group_id).or_default().push(entry);
-            } else if let Ok(info) = nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks) {
+            } else if let Ok(info) =
+                nca::parse_nca_info(reader, entry.abs_offset, entry.size, &entry.name, ks)
+            {
                 groups.entry(info.title_id).or_default().push(entry);
             }
         }

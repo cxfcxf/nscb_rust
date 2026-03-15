@@ -51,10 +51,20 @@ pub fn parse_title_block_at(data: &[u8], base_offset: usize) -> Option<String> {
         let title_raw = &data[start..start + TITLE_SIZE];
         let pub_raw = &data[start + TITLE_SIZE..start + TITLE_SIZE + PUBLISHER_SIZE];
 
-        let t_end = title_raw.iter().position(|b| *b == 0).unwrap_or(title_raw.len());
-        let p_end = pub_raw.iter().position(|b| *b == 0).unwrap_or(pub_raw.len());
-        let title = String::from_utf8_lossy(&title_raw[..t_end]).trim().to_string();
-        let publisher = String::from_utf8_lossy(&pub_raw[..p_end]).trim().to_string();
+        let t_end = title_raw
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(title_raw.len());
+        let p_end = pub_raw
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(pub_raw.len());
+        let title = String::from_utf8_lossy(&title_raw[..t_end])
+            .trim()
+            .to_string();
+        let publisher = String::from_utf8_lossy(&pub_raw[..p_end])
+            .trim()
+            .to_string();
         if is_plausible_title(&title) && is_plausible_publisher(&publisher) {
             valid_count += 1;
             if first_valid.is_none() {

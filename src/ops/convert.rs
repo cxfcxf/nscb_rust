@@ -108,12 +108,7 @@ fn nsp_to_xci(input_path: &str, output_path: &str, ks: &KeyStore) -> Result<()> 
         let gc_flag =
             crate::formats::nca::python_xci_gamecard_flag(&parsed, ks, source_is_cartridge);
         let patched_header =
-            crate::formats::nca::rewrite_header_for_xci(
-                &enc_header,
-                ks,
-                title_key,
-                gc_flag,
-            )?;
+            crate::formats::nca::rewrite_header_for_xci(&enc_header, ks, title_key, gc_flag)?;
         let hash = crate::crypto::hash::sha256(&patched_header[..0x200]);
         secure_builder.add_file(entry.name.clone(), entry.size, hash, 0x200);
         prepared.push(PreparedNca {
@@ -262,7 +257,12 @@ fn xci_to_nsp(input_path: &str, output_path: &str, _ks: &KeyStore) -> Result<()>
         file.read_exact(&mut enc_header)?;
         let patched_header = crate::formats::nca::rewrite_header_for_nsp(&enc_header, _ks)?;
         let meta_hash = if entry.name.ends_with(".cnmt.nca") {
-            Some(hash_patched_nca(&mut file, entry.abs_offset, entry.size, &patched_header)?)
+            Some(hash_patched_nca(
+                &mut file,
+                entry.abs_offset,
+                entry.size,
+                &patched_header,
+            )?)
         } else {
             None
         };

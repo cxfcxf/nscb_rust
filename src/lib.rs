@@ -6,5 +6,6 @@ pub mod crypto;
 pub mod error;
 pub mod formats;
 pub mod keys;
+pub mod nutdb;
 pub mod ops;
 pub mod util;

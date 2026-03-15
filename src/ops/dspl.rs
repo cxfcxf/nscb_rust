@@ -15,7 +15,12 @@ use crate::keys::KeyStore;
 use crate::ops::split::{group_nsp_entries, group_xci_entries, TitleGroup};
 use crate::util::{io as uio, progress};
 
-pub fn split_to_files(path: &str, output_dir: &str, output_type: &str, ks: &KeyStore) -> Result<()> {
+pub fn split_to_files(
+    path: &str,
+    output_dir: &str,
+    output_type: &str,
+    ks: &KeyStore,
+) -> Result<()> {
     std::fs::create_dir_all(output_dir)?;
     let ext = Path::new(path)
         .extension()
@@ -64,7 +69,10 @@ fn write_groups(
 
 fn should_emit_xci(group: &TitleGroup, output_type: &str) -> bool {
     output_type.eq_ignore_ascii_case("xci")
-        && matches!(group.title_type, Some(crate::formats::types::TitleType::Application))
+        && matches!(
+            group.title_type,
+            Some(crate::formats::types::TitleType::Application)
+        )
 }
 
 fn python_dspl_output_name(group: &TitleGroup, output_type: &str) -> String {
@@ -72,7 +80,11 @@ fn python_dspl_output_name(group: &TitleGroup, output_type: &str) -> String {
         Some(crate::formats::types::TitleType::AddOnContent) => "DLC".to_string(),
         _ => python_title_spacing(&group.game_name),
     };
-    let ext = if should_emit_xci(group, output_type) { "xci" } else { "nsp" };
+    let ext = if should_emit_xci(group, output_type) {
+        "xci"
+    } else {
+        "nsp"
+    };
     format!(
         "{} [{:016x}] [v{}].{}",
         title,
@@ -164,7 +176,9 @@ fn write_group_as_xci(
         let parsed = NcaHeader::from_encrypted(&enc_header, ks)?;
         let title_key = if parsed.has_rights_id() {
             if let Some(enc_title_key) = enc_title_keys_by_rights.get(&parsed.rights_id) {
-                Some(ks.decrypt_title_key(enc_title_key, parsed.key_generation().saturating_sub(1))?)
+                Some(
+                    ks.decrypt_title_key(enc_title_key, parsed.key_generation().saturating_sub(1))?,
+                )
             } else {
                 None
             }
@@ -196,9 +210,24 @@ fn write_group_as_xci(
     let secure_hash = crate::crypto::hash::sha256(&secure_header);
 
     let mut root_builder = Hfs0Builder::new();
-    root_builder.add_file("update".to_string(), empty_partition.len() as u64, empty_hash, 0x200);
-    root_builder.add_file("normal".to_string(), empty_partition.len() as u64, empty_hash, 0x200);
-    root_builder.add_file("secure".to_string(), secure_total, secure_hash, secure_header.len() as u32);
+    root_builder.add_file(
+        "update".to_string(),
+        empty_partition.len() as u64,
+        empty_hash,
+        0x200,
+    );
+    root_builder.add_file(
+        "normal".to_string(),
+        empty_partition.len() as u64,
+        empty_hash,
+        0x200,
+    );
+    root_builder.add_file(
+        "secure".to_string(),
+        secure_total,
+        secure_hash,
+        secure_header.len() as u32,
+    );
 
     let root_header = root_builder.build_header_aligned(0x200);
     let root_hash = crate::crypto::hash::sha256(&root_header);
@@ -230,7 +259,9 @@ fn write_group_as_xci(
     out.write_all(&game_info)?;
     out.write_all(&sig_padding)?;
     out.write_all(&fake_cert)?;
-    if (xci_header.len() + game_info.len() + sig_padding.len() + fake_cert.len()) as u64 != XCI_PREFIX_SIZE {
+    if (xci_header.len() + game_info.len() + sig_padding.len() + fake_cert.len()) as u64
+        != XCI_PREFIX_SIZE
+    {
         return Err(NscbError::InvalidData("XCI prefix size mismatch".into()));
     }
     out.write_all(&root_header)?;

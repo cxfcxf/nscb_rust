@@ -435,7 +435,13 @@ pub fn python_xci_gamecard_flag(header: &NcaHeader, ks: &KeyStore, is_cartridge:
     }
     header
         .decrypt_key_area(ks)
-        .map(|keys| if keys[0].iter().all(|&b| b == 0) { 1 } else { 0 })
+        .map(|keys| {
+            if keys[0].iter().all(|&b| b == 0) {
+                1
+            } else {
+                0
+            }
+        })
         .unwrap_or(0)
 }
 
@@ -510,7 +516,8 @@ pub fn patch_meta_nca_with_rsvcap(
         return Err(NscbError::InvalidData("NCA image too short".into()));
     }
 
-    let (mut header_dec, xts_key, le_sector) = decrypt_header_for_edit(&encrypted_nca[..0xC00], ks)?;
+    let (mut header_dec, xts_key, le_sector) =
+        decrypt_header_for_edit(&encrypted_nca[..0xC00], ks)?;
     let header = NcaHeader::from_decrypted(header_dec.clone())?;
     if header.content_type_enum() != Some(ContentType::Meta) {
         return Ok(None);
@@ -530,9 +537,14 @@ pub fn patch_meta_nca_with_rsvcap(
         }
 
         let section_enc = &encrypted_nca[sec_start..sec_end];
-            if let Some((mut section_plain, mode, before, after)) =
-            patch_meta_section(section_enc, &header, sec_idx, &section_keys, new_rsv, keygen_hint)
-            {
+        if let Some((mut section_plain, mode, before, after)) = patch_meta_section(
+            section_enc,
+            &header,
+            sec_idx,
+            &section_keys,
+            new_rsv,
+            keygen_hint,
+        ) {
             update_meta_hashes(&mut header_dec, &mut section_plain, &header)?;
 
             let mut output = encrypted_nca.to_vec();
@@ -547,7 +559,13 @@ pub fn patch_meta_nca_with_rsvcap(
                     little_endian,
                 } => {
                     let mut reenc = section_plain;
-                    aes_ctr_transform_in_place(&key, &nonce, file_offset, little_endian, &mut reenc);
+                    aes_ctr_transform_in_place(
+                        &key,
+                        &nonce,
+                        file_offset,
+                        little_endian,
+                        &mut reenc,
+                    );
                     output[sec_start..sec_end].copy_from_slice(&reenc);
                 }
             }
@@ -594,9 +612,12 @@ fn patch_meta_section(
             for &little_endian in &[true, false] {
                 let mut dec = section_enc.to_vec();
                 aes_ctr_transform_in_place(key, &nonce, file_offset, little_endian, &mut dec);
-                if let Some((before, after)) =
-                    patch_cnmt_required_system_version_in_section(&mut dec, header, new_rsv, keygen_hint)
-                {
+                if let Some((before, after)) = patch_cnmt_required_system_version_in_section(
+                    &mut dec,
+                    header,
+                    new_rsv,
+                    keygen_hint,
+                ) {
                     return Some((
                         dec,
                         SectionCryptoMode::Ctr {
@@ -664,7 +685,9 @@ fn update_meta_hashes(
 
     let mult = pfs0_size.div_ceil(block_size);
     let pfs0_hash_len = 0x20usize.saturating_mul(mult);
-    if htable_offset + pfs0_hash_len > section_plain.len() || pfs0_offset + pfs0_size > section_plain.len() {
+    if htable_offset + pfs0_hash_len > section_plain.len()
+        || pfs0_offset + pfs0_size > section_plain.len()
+    {
         return Ok(());
     }
 
@@ -672,7 +695,9 @@ fn update_meta_hashes(
     let pfs0_hash = Sha256::digest(&section_plain[pfs0_offset..pfs0_offset + pfs0_block_len]);
     section_plain[htable_offset..htable_offset + 0x20].copy_from_slice(&pfs0_hash);
 
-    let htable_hash = Sha256::digest(&section_plain[htable_offset..htable_offset + pfs0_hash_len.min(htable_size)]);
+    let htable_hash = Sha256::digest(
+        &section_plain[htable_offset..htable_offset + pfs0_hash_len.min(htable_size)],
+    );
     header_dec[0x408..0x428].copy_from_slice(&htable_hash);
 
     let hblock_hash = Sha256::digest(&header_dec[0x400..0x600]);

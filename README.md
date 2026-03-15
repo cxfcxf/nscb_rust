@@ -4,6 +4,7 @@ Rust implementation of core Nintendo Switch content workflows inspired by NSC_Bu
 
 Implemented operations:
 - Merge (`--direct_multi`, `-d`)
+- Rename files/folders using package metadata + NUTDB (`--renamef`)
 - Split (`--splitter`)
 - Split to repacked files (`--dspl`)
 - Create/Repack NSP from folder (`--create` + `--ifolder`)
@@ -71,6 +72,13 @@ target/release/nscb --help
 - `--level <1-22>`: compression level (default: `3`)
 - `-n, --nodelta`: exclude delta NCAs during merge
 
+## NUTDB Options
+
+- `--nutdb-refresh`: refresh the local NUTDB cache
+- `--nutdb-lookup <titleid>`: inspect a cached NUTDB entry
+- `--nutdb-cache-dir <dir>`: override the NUTDB cache directory
+- `--nutdb-url <url>`: override the NUTDB source URL
+
 ## Usage
 
 ### 1) Merge base/update/DLC
@@ -82,7 +90,42 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 2) Split by title ID (CNMT-aware naming)
+### 2) Rename a file or folder using package metadata and NUTDB
+
+```bash
+target/release/nscb \
+  --renamef "/path/to/library_or_file" \
+  --renmode skip_corr_tid \
+  --addlangue true \
+  --noversion false \
+  --dlcrname false \
+  --keys /path/to/prod.keys
+```
+
+Behavior:
+- renames supported files recursively: `.nsp`, `.nsx`, `.nsz`, `.xci`, `.xcz`
+- uses package metadata first, then cached NUTDB names as fallback
+- auto-refreshes the NUTDB cache on demand using conditional HTTP when supported
+- keeps Python `squirrel.py` CLI names and accepted values for the main rename path:
+  `--renamef <path>`
+  `--renmode <force|skip_corr_tid|skip_if_tid>`
+  `--addlangue <true|false>`
+  `--noversion <false|true|xci_no_v0>`
+  `--dlcrname <false|true|tag>`
+- parity-tested against Python for exact rename output in these cases:
+  basic rename, `force`, `skip_corr_tid`, `skip_if_tid`, `addlangue`,
+  `noversion=true`, `noversion=xci_no_v0`, `dlcrname=true`, `dlcrname=tag`
+- appends ` (SeemsDuplicate)` when the target filename already exists
+- appends ` (needscheck)` when a valid title name/title ID cannot be resolved
+
+### 3) Refresh or inspect the NUTDB cache
+
+```bash
+target/release/nscb --nutdb-refresh
+target/release/nscb --nutdb-lookup 0100F8F0000A2000
+```
+
+### 4) Split by title ID (CNMT-aware naming)
 
 ```bash
 target/release/nscb \
@@ -99,7 +142,7 @@ Expected split output:
 - Each folder contains extracted title content files, primarily `.nca`/`.ncz`.
 - Tickets/certs are not guaranteed in split output; `--splitter` is designed for content grouping.
 
-### 3) Create/Repack NSP from a split folder
+### 5) Create/Repack NSP from a split folder
 
 ```bash
 target/release/nscb \
@@ -115,7 +158,7 @@ Expected create behavior:
   - Split merged file with `--splitter`
   - Repack one split folder with `--create`
 
-### 4) Split to per-title NSP/XCI files
+### 6) Split to per-title NSP/XCI files
 
 ```bash
 target/release/nscb \
@@ -125,7 +168,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 5) View detailed container contents
+### 7) View detailed container contents
 
 ```bash
 target/release/nscb \
@@ -133,7 +176,7 @@ target/release/nscb \
   --keys /path/to/prod.keys
 ```
 
-### 6) View title metadata summary
+### 8) View title metadata summary
 
 ```bash
 target/release/nscb \
@@ -141,7 +184,7 @@ target/release/nscb \
   --keys /path/to/prod.keys
 ```
 
-### 7) Convert NSP -> XCI
+### 9) Convert NSP -> XCI
 
 ```bash
 target/release/nscb \
@@ -151,7 +194,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 8) Convert XCI -> NSP
+### 10) Convert XCI -> NSP
 
 ```bash
 target/release/nscb \
@@ -161,7 +204,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 9) Compress NSP -> NSZ (or XCI -> XCZ)
+### 11) Compress NSP -> NSZ (or XCI -> XCZ)
 
 ```bash
 target/release/nscb \
@@ -171,7 +214,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 10) Decompress NSZ -> NSP (or XCZ -> XCI, NCZ -> NCA)
+### 12) Decompress NSZ -> NSP (or XCZ -> XCI, NCZ -> NCA)
 
 ```bash
 target/release/nscb \
@@ -180,7 +223,7 @@ target/release/nscb \
   -o /path/to/output
 ```
 
-### 11) Merge with firmware caps
+### 13) Merge with firmware caps
 
 ```bash
 target/release/nscb \

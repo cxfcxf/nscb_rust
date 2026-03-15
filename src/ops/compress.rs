@@ -87,14 +87,15 @@ fn compress_nsp(input_path: &str, output_path: &str, level: i32, ks: &KeyStore) 
                 continue;
             }
 
-            let sections = match build_ncz_sections(&mut file, abs_offset, &header, &title_keys, ks)? {
-                Some(s) => s,
-                None => {
-                    // Missing title key for rights-based NCA: keep as-is.
-                    other_files.push((entry.name.clone(), abs_offset, entry.size));
-                    continue;
-                }
-            };
+            let sections =
+                match build_ncz_sections(&mut file, abs_offset, &header, &title_keys, ks)? {
+                    Some(s) => s,
+                    None => {
+                        // Missing title key for rights-based NCA: keep as-is.
+                        other_files.push((entry.name.clone(), abs_offset, entry.size));
+                        continue;
+                    }
+                };
 
             let ncz_name = entry.name.replace(".nca", ".ncz");
             println!(
@@ -105,7 +106,14 @@ fn compress_nsp(input_path: &str, output_path: &str, level: i32, ks: &KeyStore) 
 
             let mut tmp = tempfile::NamedTempFile::new()?;
             file.seek(SeekFrom::Start(abs_offset))?;
-            ncz::compress_nca(&mut file, &mut tmp, nca_size, &sections, level, Some(&compress_pb))?;
+            ncz::compress_nca(
+                &mut file,
+                &mut tmp,
+                nca_size,
+                &sections,
+                level,
+                Some(&compress_pb),
+            )?;
             compressed_files.push((ncz_name, tmp));
         } else {
             other_files.push((entry.name.clone(), nsp.file_abs_offset(entry), entry.size));
@@ -170,7 +178,11 @@ fn compress_xci(input_path: &str, output_path: &str, level: i32, ks: &KeyStore) 
                     secure_out.push(PackedSecureEntry {
                         name: entry.name.clone(),
                         size: entry.size,
-                        hash: hash_first_n_from_reader(&mut file, abs_offset, entry.size.min(0x200))?,
+                        hash: hash_first_n_from_reader(
+                            &mut file,
+                            abs_offset,
+                            entry.size.min(0x200),
+                        )?,
                         source: EntrySource::Input {
                             abs_offset,
                             size: entry.size,
@@ -196,29 +208,37 @@ fn compress_xci(input_path: &str, output_path: &str, level: i32, ks: &KeyStore) 
                 continue;
             }
 
-            let sections = match build_ncz_sections(&mut file, abs_offset, &header, &empty_title_keys, ks)? {
-                Some(s) => s,
-                None => {
-                    secure_out.push(PackedSecureEntry {
-                        name: entry.name.clone(),
-                        size: entry.size,
-                        hash: hash_first_n_from_reader(
-                            &mut file,
-                            abs_offset,
-                            entry.size.min(0x200),
-                        )?,
-                        source: EntrySource::Input {
-                            abs_offset,
+            let sections =
+                match build_ncz_sections(&mut file, abs_offset, &header, &empty_title_keys, ks)? {
+                    Some(s) => s,
+                    None => {
+                        secure_out.push(PackedSecureEntry {
+                            name: entry.name.clone(),
                             size: entry.size,
-                        },
-                    });
-                    continue;
-                }
-            };
+                            hash: hash_first_n_from_reader(
+                                &mut file,
+                                abs_offset,
+                                entry.size.min(0x200),
+                            )?,
+                            source: EntrySource::Input {
+                                abs_offset,
+                                size: entry.size,
+                            },
+                        });
+                        continue;
+                    }
+                };
 
             let mut tmp = tempfile::NamedTempFile::new()?;
             file.seek(SeekFrom::Start(abs_offset))?;
-            ncz::compress_nca(&mut file, &mut tmp, entry.size, &sections, level, Some(&compress_pb))?;
+            ncz::compress_nca(
+                &mut file,
+                &mut tmp,
+                entry.size,
+                &sections,
+                level,
+                Some(&compress_pb),
+            )?;
             let size = tmp.as_file().metadata()?.len();
             let hash = hash_first_n_from_temp(&mut tmp, size.min(0x200))?;
             secure_out.push(PackedSecureEntry {
@@ -350,7 +370,7 @@ fn compress_xci(input_path: &str, output_path: &str, level: i32, ks: &KeyStore) 
 fn collect_enc_title_keys_from_nsp<R: Read + Seek>(
     reader: &mut R,
     nsp: &Nsp,
- ) -> Result<HashMap<[u8; 16], [u8; 16]>> {
+) -> Result<HashMap<[u8; 16], [u8; 16]>> {
     let mut out = HashMap::new();
     for tik in nsp.ticket_entries() {
         let abs_offset = nsp.file_abs_offset(tik);
@@ -482,7 +502,12 @@ fn parse_bktr_sections_for_index<R: Read + Seek>(
     if crypto_type == 3 || crypto_type == 4 {
         let cipher = Aes128::new_from_slice(&section_key)
             .map_err(|e| NscbError::Crypto(format!("AES key init: {e}")))?;
-        aes_ctr_transform_in_place(&cipher, &base_ctr[..8], sec.start_offset() + bktr_off, &mut enc);
+        aes_ctr_transform_in_place(
+            &cipher,
+            &base_ctr[..8],
+            sec.start_offset() + bktr_off,
+            &mut enc,
+        );
     }
 
     let mut cur = Cursor::new(enc);
@@ -612,7 +637,11 @@ fn aes_ctr_transform_in_place(cipher: &Aes128, nonce8: &[u8], file_offset: u64, 
     }
 }
 
-fn hash_first_n_from_reader<R: Read + Seek>(reader: &mut R, offset: u64, n: u64) -> Result<[u8; 32]> {
+fn hash_first_n_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    n: u64,
+) -> Result<[u8; 32]> {
     if n == 0 {
         return Ok(hash::sha256(&[]));
     }

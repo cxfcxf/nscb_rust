@@ -274,7 +274,8 @@ fn copy_nca_with_eshop_flag(
 
     let mut enc_header = vec![0u8; 0xC00];
     src.read_exact(&mut enc_header)?;
-    let patched = crate::formats::nca::rewrite_header_for_nsp(&enc_header, ks).unwrap_or(enc_header);
+    let patched =
+        crate::formats::nca::rewrite_header_for_nsp(&enc_header, ks).unwrap_or(enc_header);
     out.write_all(&patched)?;
     pb.inc(patched.len() as u64);
 

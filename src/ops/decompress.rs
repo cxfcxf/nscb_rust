@@ -258,8 +258,13 @@ fn decompress_xcz(input_path: &str, output_path: &str) -> Result<()> {
             }
         } else {
             let abs_offset = xci.root_hfs0.file_abs_offset(root_e);
-            let copied =
-                uio::copy_section_tolerant(&mut file, &mut out, abs_offset, root_e.size, Some(&pb))?;
+            let copied = uio::copy_section_tolerant(
+                &mut file,
+                &mut out,
+                abs_offset,
+                root_e.size,
+                Some(&pb),
+            )?;
             if copied < root_e.size {
                 uio::write_padding(&mut out, root_e.size - copied)?;
                 pb.inc(root_e.size - copied);
@@ -294,7 +299,11 @@ fn decompress_single_ncz(input_path: &str, output_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn hash_first_n_from_reader<R: Read + Seek>(reader: &mut R, offset: u64, n: u64) -> Result<[u8; 32]> {
+fn hash_first_n_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+    n: u64,
+) -> Result<[u8; 32]> {
     if n == 0 {
         return Ok(hash::sha256(&[]));
     }

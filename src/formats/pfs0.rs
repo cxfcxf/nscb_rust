@@ -199,8 +199,7 @@ impl Pfs0Builder {
 
     /// Calculate the header size for the current file list.
     pub fn header_size(&self) -> u64 {
-        let raw_string_table_size: u64 =
-            self.files.iter().map(|f| (f.name.len() + 1) as u64).sum();
+        let raw_string_table_size: u64 = self.files.iter().map(|f| (f.name.len() + 1) as u64).sum();
         let raw_header_size = 0x10 + (self.files.len() as u64 * ENTRY_SIZE) + raw_string_table_size;
         align_up(raw_header_size, PFS0_ALIGN)
     }
@@ -222,7 +221,8 @@ impl Pfs0Builder {
         // squirrel.py aligns the total PFS0 header to 0x10, with any required
         // padding appended to the string table region.
         let fixed_header_size = 0x10 + (self.files.len() as u64 * ENTRY_SIZE);
-        let aligned_header_size = align_up(fixed_header_size + string_table.len() as u64, PFS0_ALIGN);
+        let aligned_header_size =
+            align_up(fixed_header_size + string_table.len() as u64, PFS0_ALIGN);
         let padded_string_table_len = (aligned_header_size - fixed_header_size) as usize;
         if padded_string_table_len > string_table.len() {
             string_table.resize(padded_string_table_len, 0);

@@ -11,6 +11,7 @@ PY_REPO="${PY_REPO:-$ROOT_DIR/.qa_suite/reference/NSC_BUILDER}"
 PY_ZTOOLS="${PY_ZTOOLS:-$PY_REPO/py/ztools}"
 PYTHON_BIN="${PYTHON_BIN:-$PY_REPO/.venv/bin/python}"
 RUST_BIN=("$ROOT_DIR/target/debug/nscb")
+PARITY_ONLY="${PARITY_ONLY:-all}"
 FAIL=0
 
 BASE_FILE="${BASE_FILE:-$(find "$TEST_DIR" -maxdepth 1 -type f -name '*.xci' | sort | head -n1)}"
@@ -88,6 +89,46 @@ compare_names() {
   if [[ "$lb" != "$rb" ]]; then
     FAIL=1
   fi
+}
+
+single_file_in_dir() {
+  local dir="$1"
+  find "$dir" -maxdepth 1 \( -type f -o -type l \) | sort | head -n1
+}
+
+run_rename_parity_case() {
+  local label="$1"
+  local source="$2"
+  local input_name="$3"
+  local py_type="$4"
+  shift 4
+  local rust_dir="$OUT_DIR/rename_cases/$label/rust"
+  local py_dir="$OUT_DIR/rename_cases/$label/py"
+  local rust_log="$OUT_DIR/logs/${label}_rust.log"
+  local py_log="$OUT_DIR/logs/${label}_py.log"
+  local -a extra_args=("$@")
+
+  mkdir -p "$rust_dir" "$py_dir"
+  ln -s "$source" "$rust_dir/$input_name"
+  ln -s "$source" "$py_dir/$input_name"
+
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --renamef "$rust_dir" --keys "$KEYS" --nutdb-cache-dir "$OUT_DIR/rust_nutdb_cache" \
+      "${extra_args[@]}" >"$rust_log" 2>&1
+  )
+  (
+    cd "$PY_ZTOOLS"
+    "$PYTHON_BIN" squirrel.py --renamef "$py_dir" --type "$py_type" \
+      "${extra_args[@]}" >"$py_log" 2>&1
+  )
+
+  local rust_out py_out
+  rust_out="$(single_file_in_dir "$rust_dir")"
+  py_out="$(single_file_in_dir "$py_dir")"
+  need_file "$rust_out"
+  need_file "$py_out"
+  compare_names "$rust_out" "$py_out" "$label"
 }
 
 sha256_skip_prefix() {
@@ -206,6 +247,66 @@ log "Build Rust binary"
   cd "$ROOT_DIR"
   cargo build >"$OUT_DIR/logs/cargo_build.log" 2>&1
 )
+
+if [[ "$HAVE_PY" -eq 1 ]]; then
+  log "Rename parity"
+  mkdir -p "$OUT_DIR/rename_cases" "$OUT_DIR/rust_nutdb_cache"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --nutdb-refresh --nutdb-cache-dir "$OUT_DIR/rust_nutdb_cache" \
+      >"$OUT_DIR/logs/rust_nutdb_refresh.log" 2>&1
+  )
+  (
+    cd "$PY_ZTOOLS"
+    "$PYTHON_BIN" squirrel.py -lib_call nutdb force_refresh \
+      >"$OUT_DIR/logs/py_nutdb_refresh.log" 2>&1
+  )
+
+  BASE_EXT="${BASE_FILE##*.}"
+  BASE_TID_UPPER="$(basename "$BASE_FILE" | grep -oE '[0-9A-Fa-f]{16}' | head -n1 | tr '[:lower:]' '[:upper:]')"
+  WRONG_TID="FFFFFFFFFFFFFFFF"
+  DLC_EXT="${DLC_FILES[0]##*.}"
+
+  run_rename_parity_case "rename_basic" \
+    "$BASE_FILE" "Generic Base.${BASE_EXT}" "$BASE_EXT"
+  run_rename_parity_case "rename_force" \
+    "$BASE_FILE" "Messy [${BASE_TID_UPPER}].${BASE_EXT}" "$BASE_EXT" \
+    --renmode force
+  run_rename_parity_case "rename_skip_corr_tid" \
+    "$BASE_FILE" "Messy [${BASE_TID_UPPER}].${BASE_EXT}" "$BASE_EXT" \
+    --renmode skip_corr_tid
+  run_rename_parity_case "rename_skip_if_tid" \
+    "$BASE_FILE" "Messy [${WRONG_TID}].${BASE_EXT}" "$BASE_EXT" \
+    --renmode skip_if_tid
+  run_rename_parity_case "rename_addlangue" \
+    "$BASE_FILE" "Language Base.${BASE_EXT}" "$BASE_EXT" \
+    --addlangue true
+  run_rename_parity_case "rename_noversion_true" \
+    "$BASE_FILE" "No Version Base.${BASE_EXT}" "$BASE_EXT" \
+    --noversion true
+  run_rename_parity_case "rename_noversion_xci_no_v0" \
+    "$BASE_FILE" "No Version Xci.${BASE_EXT}" "$BASE_EXT" \
+    --noversion xci_no_v0
+  run_rename_parity_case "rename_dlcrname_true" \
+    "${DLC_FILES[0]}" "Generic DLC.${DLC_EXT}" "$DLC_EXT" \
+    --dlcrname true
+  run_rename_parity_case "rename_dlcrname_tag" \
+    "${DLC_FILES[0]}" "Tagged DLC.${DLC_EXT}" "$DLC_EXT" \
+    --dlcrname tag
+fi
+
+if [[ "$PARITY_ONLY" == "rename" ]]; then
+  echo
+  if [[ "$FAIL" -eq 0 ]]; then
+    echo "Rename parity PASSED."
+    echo "Artifacts and logs: $OUT_DIR"
+    exit 0
+  else
+    echo "Rename parity FAILED." >&2
+    echo "Inspect logs/artifacts under: $OUT_DIR" >&2
+    exit 1
+  fi
+fi
 
 MERGE_INPUTS=("$BASE_FILE" "$UPD_FILE" "${DLC_FILES[@]}")
 printf "%s\n" "${MERGE_INPUTS[@]}" >"$OUT_DIR/merge_list.txt"

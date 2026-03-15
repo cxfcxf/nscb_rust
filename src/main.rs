@@ -7,6 +7,7 @@ mod crypto;
 mod error;
 mod formats;
 mod keys;
+mod nutdb;
 mod ops;
 mod util;
 

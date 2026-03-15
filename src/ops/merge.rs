@@ -366,7 +366,11 @@ fn collect_from_nsp(
     }
 
     // Python-style order: CNMT content entries first, then meta NCA.
-    for meta in nsp.nca_entries().into_iter().filter(|e| e.name.ends_with(".cnmt.nca")) {
+    for meta in nsp
+        .nca_entries()
+        .into_iter()
+        .filter(|e| e.name.ends_with(".cnmt.nca"))
+    {
         if !selected_names.contains(&meta.name) {
             continue;
         }
@@ -593,7 +597,8 @@ fn build_nsp_output(
         for nca in ncas {
             items.push(Item::Nca(nca));
             if nca.nca_name.ends_with(".cnmt.nca") {
-                let xml_name = format!("{}.xml", nca.nca_name.trim_end_matches(".nca")).to_ascii_lowercase();
+                let xml_name =
+                    format!("{}.xml", nca.nca_name.trim_end_matches(".nca")).to_ascii_lowercase();
                 if let Some(xml) = xml_by_name.get(&xml_name) {
                     items.push(Item::Xml(xml));
                 }
@@ -681,14 +686,14 @@ fn build_nsp_output(
                             if entry.nca_name.ends_with(".cnmt.nca") {
                                 if let Some((patched, before, after)) =
                                     crate::formats::nca::patch_meta_nca_with_rsvcap(
-                                        &nca_bytes,
-                                        ks,
-                                        cap,
-                                        keypatch,
+                                        &nca_bytes, ks, cap, keypatch,
                                     )?
                                 {
                                     if print_version {
-                                        println!("CNMT {} RSV {} -> {}", entry.nca_name, before, after);
+                                        println!(
+                                            "CNMT {} RSV {} -> {}",
+                                            entry.nca_name, before, after
+                                        );
                                     }
                                     nca_bytes = patched;
                                 }
@@ -697,18 +702,17 @@ fn build_nsp_output(
                         if let Some(new_keygen) = keypatch {
                             let parsed = NcaHeader::from_encrypted(&nca_bytes[..0xC00], ks)?;
                             if new_keygen < parsed.crypto_type2 {
-                                let patched_header = crate::formats::nca::rewrite_header_with_keygen(
-                                    &nca_bytes[..0xC00],
-                                    ks,
-                                    new_keygen,
-                                    false,
-                                )?;
+                                let patched_header =
+                                    crate::formats::nca::rewrite_header_with_keygen(
+                                        &nca_bytes[..0xC00],
+                                        ks,
+                                        new_keygen,
+                                        false,
+                                    )?;
                                 if print_version {
                                     println!(
                                         "NCA {} keygen {} -> {}",
-                                        entry.nca_name,
-                                        parsed.crypto_type2,
-                                        new_keygen
+                                        entry.nca_name, parsed.crypto_type2, new_keygen
                                     );
                                 }
                                 nca_bytes[..0xC00].copy_from_slice(&patched_header);
@@ -717,7 +721,13 @@ fn build_nsp_output(
                         out.write_all(&nca_bytes)?;
                         pb.inc(nca_bytes.len() as u64);
                     } else {
-                        uio::copy_section(&mut src, &mut out, entry.abs_offset, entry.size, Some(&pb))?;
+                        uio::copy_section(
+                            &mut src,
+                            &mut out,
+                            entry.abs_offset,
+                            entry.size,
+                            Some(&pb),
+                        )?;
                     }
                 }
             }
@@ -745,7 +755,9 @@ fn build_nsp_output(
                 if let Some(bytes) = &xml.inline_data {
                     out.write_all(bytes)?;
                     pb.inc(bytes.len() as u64);
-                } else if let (Some(source_path), Some(abs_offset)) = (&xml.source_path, xml.abs_offset) {
+                } else if let (Some(source_path), Some(abs_offset)) =
+                    (&xml.source_path, xml.abs_offset)
+                {
                     let src_file = File::open(source_path).map_err(|e| {
                         NscbError::Io(std::io::Error::new(
                             e.kind(),
@@ -817,7 +829,9 @@ fn maybe_add_generated_xml(
     if !meta_name.ends_with(".cnmt.nca") {
         return Ok(());
     }
-    let Some((cnmt, digest, crypto2, keygen, nsha)) = parse_meta_xml_info(file, abs_offset, size, ks)? else {
+    let Some((cnmt, digest, crypto2, keygen, nsha)) =
+        parse_meta_xml_info(file, abs_offset, size, ks)?
+    else {
         return Ok(());
     };
     let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
@@ -856,7 +870,9 @@ pub(crate) fn generate_meta_xml_bytes(
     if !meta_name.ends_with(".cnmt.nca") {
         return Ok(None);
     }
-    let Some((cnmt, digest, crypto2, keygen, nsha)) = parse_meta_xml_info(file, abs_offset, size, ks)? else {
+    let Some((cnmt, digest, crypto2, keygen, nsha)) =
+        parse_meta_xml_info(file, abs_offset, size, ks)?
+    else {
         return Ok(None);
     };
     let xml_name = meta_name.trim_end_matches(".nca").to_string() + ".xml";
@@ -905,7 +921,11 @@ fn parse_meta_xml_info(
         }
         let section = &nca_bytes[rel..end];
         if let Some((cnmt, digest)) = parse_cnmt_and_digest_from_section(section) {
-            let digest = if xml_digest != [0u8; 32] { xml_digest } else { digest };
+            let digest = if xml_digest != [0u8; 32] {
+                xml_digest
+            } else {
+                digest
+            };
             return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
         }
         let nonce = header.section_ctr_nonce(sec_idx);
@@ -913,7 +933,11 @@ fn parse_meta_xml_info(
             let mut dec = section.to_vec();
             aes_ctr_transform_in_place(key, &nonce, sec.start_offset(), &mut dec);
             if let Some((cnmt, digest)) = parse_cnmt_and_digest_from_section(&dec) {
-                let digest = if xml_digest != [0u8; 32] { xml_digest } else { digest };
+                let digest = if xml_digest != [0u8; 32] {
+                    xml_digest
+                } else {
+                    digest
+                };
                 return Ok(Some((cnmt, digest, crypto2, keygen, nsha)));
             }
         }
@@ -934,7 +958,9 @@ fn python_xml_digest(
     let pfs0_abs = 0xC00u64
         .checked_add(header.htable_offset())?
         .checked_add(header.pfs0_offset())?;
-    let digest_abs = pfs0_abs.checked_add(header.pfs0_size())?.checked_sub(0x20)?;
+    let digest_abs = pfs0_abs
+        .checked_add(header.pfs0_size())?
+        .checked_sub(0x20)?;
 
     for sec_idx in 0..4 {
         let sec = &header.section_table[sec_idx];
@@ -1015,8 +1041,16 @@ mod tests {
     #[test]
     fn direct_multi_keeps_highest_version_per_title_id() {
         let groups = vec![
-            vec![fake_group(0x0100_0000_0000_0800, 262_144, Some(TitleType::Patch))],
-            vec![fake_group(0x0100_0000_0000_0800, 327_680, Some(TitleType::Patch))],
+            vec![fake_group(
+                0x0100_0000_0000_0800,
+                262_144,
+                Some(TitleType::Patch),
+            )],
+            vec![fake_group(
+                0x0100_0000_0000_0800,
+                327_680,
+                Some(TitleType::Patch),
+            )],
         ];
         let picked = pick_best_title_groups(&groups);
         let expected = HashMap::from([(
@@ -1027,20 +1061,40 @@ mod tests {
             },
         )]);
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.input_index), Some(1));
-        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.version), Some(327_680));
+        assert_eq!(
+            picked.get(&0x0100_0000_0000_0800).map(|s| s.input_index),
+            Some(1)
+        );
+        assert_eq!(
+            picked.get(&0x0100_0000_0000_0800).map(|s| s.version),
+            Some(327_680)
+        );
         assert_eq!(picked, expected);
     }
 
     #[test]
     fn direct_multi_keeps_first_when_versions_tie() {
         let groups = vec![
-            vec![fake_group(0x0100_0000_0000_0800, 327_680, Some(TitleType::Patch))],
-            vec![fake_group(0x0100_0000_0000_0800, 327_680, Some(TitleType::Patch))],
+            vec![fake_group(
+                0x0100_0000_0000_0800,
+                327_680,
+                Some(TitleType::Patch),
+            )],
+            vec![fake_group(
+                0x0100_0000_0000_0800,
+                327_680,
+                Some(TitleType::Patch),
+            )],
         ];
         let picked = pick_best_title_groups(&groups);
-        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.input_index), Some(0));
-        assert_eq!(picked.get(&0x0100_0000_0000_0800).map(|s| s.version), Some(327_680));
+        assert_eq!(
+            picked.get(&0x0100_0000_0000_0800).map(|s| s.input_index),
+            Some(0)
+        );
+        assert_eq!(
+            picked.get(&0x0100_0000_0000_0800).map(|s| s.version),
+            Some(327_680)
+        );
     }
 }
 
@@ -1130,13 +1184,19 @@ fn build_python_cnmt_xml(
     out.push_str(&format!("    <KeyGeneration>{}</KeyGeneration>\n", keygen));
     out.push_str("  </Content>\n");
     out.push_str(&format!("  <Digest>{}</Digest>\n", hex::encode(digest)));
-    out.push_str(&format!("  <KeyGenerationMin>{}</KeyGenerationMin>\n", keygen));
+    out.push_str(&format!(
+        "  <KeyGenerationMin>{}</KeyGenerationMin>\n",
+        keygen
+    ));
     out.push_str(&format!(
         "  <RequiredSystemVersion>{}</RequiredSystemVersion>\n",
         cnmt.required_system_version
     ));
     let original_id = u64::from_le_bytes(cnmt.raw[0x20..0x28].try_into().unwrap_or([0u8; 8]));
-    out.push_str(&format!("  <OriginalId>0x{:016x}</OriginalId>\n", original_id));
+    out.push_str(&format!(
+        "  <OriginalId>0x{:016x}</OriginalId>\n",
+        original_id
+    ));
     out.push_str("</ContentMeta>");
     out
 }
@@ -1212,7 +1272,7 @@ fn parse_cnmt_from_section_bytes(section: &[u8]) -> Option<Cnmt> {
                     return Some(cnmt);
                 }
             }
-        }        
+        }
     }
     None
 }
@@ -1297,9 +1357,9 @@ fn build_xci_output(
     let source_is_cartridge: HashMap<String, bool> = source_headers_by_path
         .iter()
         .map(|(path, headers)| {
-            let has_program = headers
-                .iter()
-                .any(|header| header.content_type_enum() == Some(crate::formats::types::ContentType::Program));
+            let has_program = headers.iter().any(|header| {
+                header.content_type_enum() == Some(crate::formats::types::ContentType::Program)
+            });
             (
                 path.clone(),
                 has_program && crate::formats::nca::python_xci_is_cartridge(headers, ks),
@@ -1384,9 +1444,7 @@ fn build_xci_output(
                 if print_version {
                     println!(
                         "NCA {} keygen {} -> {}",
-                        nca.nca_name,
-                        parsed.crypto_type2,
-                        new_keygen
+                        nca.nca_name, parsed.crypto_type2, new_keygen
                     );
                 }
             }
