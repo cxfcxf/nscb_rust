@@ -214,6 +214,7 @@ Use the included parity runner to compare Rust outputs against NSC_BUILDER Pytho
 - create parity
 - compress/decompress parity
 - XCZ mixed-input merge parity
+- mixed `XCI base + NSP update -> NSP` regression
 - `ADVcontentlist` output parity
 - `ADVfilelist` output parity
 - `dspl` filename parity
@@ -228,7 +229,7 @@ The parity runner expects a local NSC_BUILDER checkout plus a Python virtualenv:
 
 ```bash
 mkdir -p .qa_suite/reference
-git clone https://github.com/cxcfxf/NSC_BUILDER .qa_suite/reference/NSC_BUILDER
+git clone https://github.com/cxfcxf/NSC_BUILDER .qa_suite/reference/NSC_BUILDER
 python3 -m venv .qa_suite/reference/NSC_BUILDER/.venv
 .qa_suite/reference/NSC_BUILDER/.venv/bin/pip install --upgrade pip setuptools wheel
 .qa_suite/reference/NSC_BUILDER/.venv/bin/pip install \
@@ -279,6 +280,7 @@ Common env vars:
 
 - `TEST_DIR`: folder containing test inputs and `prod.keys`
 - `MULTI_UPDATE_DIR`: separate folder for multi-update selection fixtures
+- `TF_DIR`: mixed `XCI base + NSP update` regression fixture folder
 - `BASE_FILE`: base input file
 - `UPD_FILE`: update input file
 - `MULTI_BASE_FILE`: base file for the multi-update regression case
@@ -299,6 +301,9 @@ Current local fixture layout used by the parity script:
 - `/mnt/e/test/op`
   Multi-update Octopath Traveler regression set:
   base `.nsp`, update `v1.0.4`, update `v1.0.5`
+- `/mnt/e/test/tf`
+  Telenet Fuku-Bukuro mixed-input regression set:
+  base `.xci`, update `.nsp`
 
 ### Intentional Differences
 
@@ -308,6 +313,8 @@ The suite is parity-first, but these differences are intentional and documented:
   Rust uses the extended RSV floor table so firmware downgrade reporting stays consistent with actual merge behavior. The Python reference falls back incorrectly for higher keygens.
 - Multi-update `--direct_multi` NSP merges with duplicate-named update tickets/certs are not forced to match Python bit-for-bit.
   Rust keeps the highest-version update cleanly. Python's NSP text-file merge path can append stale ticket/cert bytes from the older update while still advertising only the newer update in the header, producing a larger malformed-but-usable NSP. Rust intentionally does not reproduce that container bug.
+- Mixed `XCI -> NSP` merges are not treated as Python-authoritative when the Python reference emits an invalid NSP.
+  This affects both the Unicorn Overlord mixed-input parity case and the Telenet Fuku-Bukuro regression fixture. In those cases the harness verifies that Rust produces a valid merged NSP with the expected content, and only performs Python split/hash comparison if the Python output is itself readable.
 - Raw compressed `.nsz` / `.xcz` bytes are not parity-gated.
   The suite enforces decompressed payload parity and filename parity instead.
 - XCI files ignore the first `0x100` bytes for exact byte comparison.
@@ -337,6 +344,7 @@ Example for the current local split fixture layout:
 ```bash
 TEST_DIR=/mnt/e/test/uo \
 MULTI_UPDATE_DIR=/mnt/e/test/op \
+TF_DIR=/mnt/e/test/tf \
 KEYS=/mnt/e/test/prod.keys \
 PY_REPO=.qa_suite/reference/NSC_BUILDER \
 PY_ZTOOLS=.qa_suite/reference/NSC_BUILDER/py/ztools \

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="${TEST_DIR:-/mnt/e/test/uo}"
 MULTI_UPDATE_DIR="${MULTI_UPDATE_DIR:-/mnt/e/test/op}"
+TF_DIR="${TF_DIR:-/mnt/e/test/tf}"
 OUT_DIR="${OUT_DIR:-$ROOT_DIR/.qa_suite/exact_script}"
 KEYS="${KEYS:-/mnt/e/test/prod.keys}"
 PY_REPO="${PY_REPO:-$ROOT_DIR/.qa_suite/reference/NSC_BUILDER}"
@@ -22,6 +23,8 @@ mapfile -t DLC_FILES < <(find "$TEST_DIR" -maxdepth 1 -type f -name '[[]DLC[]]*.
 MULTI_BASE_FILE="${MULTI_BASE_FILE:-$(find "$MULTI_UPDATE_DIR" -maxdepth 1 -type f -name 'OCTOPATH TRAVELER*.nsp' ! -name '[[]UPD[]]*' | sort | head -n1)}"
 MULTI_UPD_OLD_FILE="${MULTI_UPD_OLD_FILE:-$(find "$MULTI_UPDATE_DIR" -maxdepth 1 -type f -name '[[]UPD[]]*v1.0.4*.nsp' | sort | head -n1)}"
 MULTI_UPD_NEW_FILE="${MULTI_UPD_NEW_FILE:-$(find "$MULTI_UPDATE_DIR" -maxdepth 1 -type f \( -name '[[]UPD[]]*v1.0.5*.nsz' -o -name '[[]UPD[]]*v1.0.5*.nsp' \) | sort | head -n1)}"
+TF_BASE_FILE="${TF_BASE_FILE:-$(find "$TF_DIR" -maxdepth 1 -type f -name '*.xci' | sort | head -n1)}"
+TF_UPD_FILE="${TF_UPD_FILE:-$(find "$TF_DIR" -maxdepth 1 -type f -name '*.nsp' | sort | head -n1)}"
 
 need_file() {
   local p="$1"
@@ -183,6 +186,11 @@ if [[ -f "$MULTI_BASE_FILE" && -f "$MULTI_UPD_OLD_FILE" && -f "$MULTI_UPD_NEW_FI
   HAVE_MULTI_UPDATE=1
 fi
 
+HAVE_TF_REGRESSION=0
+if [[ -f "$TF_BASE_FILE" && -f "$TF_UPD_FILE" ]]; then
+  HAVE_TF_REGRESSION=1
+fi
+
 if [[ "$HAVE_PY" -eq 1 && ! -f "$PY_ZTOOLS/Fs/Nsp.py" ]]; then
   echo "Missing Python reference sources under $PY_ZTOOLS" >&2
   exit 1
@@ -225,9 +233,21 @@ if [[ "$HAVE_PY" -eq 1 ]]; then
   compare_names "$RUST_MERGED_NSP" "$PY_MERGED_NSP" "merge_nsp_filename"
 
   log "Merge NSP parity (payload compare via split/hash)"
-  sha256sum "$RUST_MERGED_NSP" | awk '{print $1}' >"$OUT_DIR/cmp/merge_rust.sha"
-  sha256sum "$PY_MERGED_NSP" | awk '{print $1}' >"$OUT_DIR/cmp/merge_py.sha"
-  diff -u "$OUT_DIR/cmp/merge_py.sha" "$OUT_DIR/cmp/merge_rust.sha" >"$OUT_DIR/cmp/merge_nsp_payload.diff" || FAIL=1
+  mkdir -p "$OUT_DIR/cmp/merge_nsp_rust" "$OUT_DIR/cmp/merge_nsp_py"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --splitter "$RUST_MERGED_NSP" --ofolder "$OUT_DIR/cmp/merge_nsp_rust" --keys "$KEYS" >"$OUT_DIR/logs/split_merge_nsp_rust.log" 2>&1
+  )
+  if (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --splitter "$PY_MERGED_NSP" --ofolder "$OUT_DIR/cmp/merge_nsp_py" --keys "$KEYS" >"$OUT_DIR/logs/split_merge_nsp_py.log" 2>&1
+  ); then
+    hash_nca_set_nested "$OUT_DIR/cmp/merge_nsp_rust" "$OUT_DIR/cmp/merge_nsp_rust.sha"
+    hash_nca_set_nested "$OUT_DIR/cmp/merge_nsp_py" "$OUT_DIR/cmp/merge_nsp_py.sha"
+    compare_hash_sets "$OUT_DIR/cmp/merge_nsp_rust.sha" "$OUT_DIR/cmp/merge_nsp_py.sha" "merge_nsp_payload"
+  else
+    echo "merge_nsp_python_reference_invalid: skip"
+  fi
 
   log "Split parity on base container"
   mkdir -p "$OUT_DIR/cmp/split_py" "$OUT_DIR/cmp/split_rust"
@@ -686,6 +706,52 @@ if [[ "$HAVE_MULTI_UPDATE" -eq 1 ]]; then
     PY_MULTI_NSP="$(newest_file "$OUT_DIR/multi_update_py" '*.nsp')"
     need_file "$PY_MULTI_NSP"
     compare_names "$RUST_MULTI_NSP" "$PY_MULTI_NSP" "multi_update_filename"
+  fi
+fi
+
+if [[ "$HAVE_TF_REGRESSION" -eq 1 ]]; then
+  log "Mixed XCI+NSP to NSP regression"
+  mkdir -p "$OUT_DIR/tf_rust" "$OUT_DIR/tf_py" "$OUT_DIR/cmp/tf_rust" "$OUT_DIR/cmp/tf_py"
+  printf "%s\n" "$TF_BASE_FILE" "$TF_UPD_FILE" >"$OUT_DIR/tf_merge_list.txt"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --direct_multi "$TF_BASE_FILE" "$TF_UPD_FILE" \
+      --type nsp --ofolder "$OUT_DIR/tf_rust" --keys "$KEYS" \
+      >"$OUT_DIR/logs/rust_tf_merge_nsp.log" 2>&1
+  )
+  RUST_TF_MERGED_NSP="$(newest_file "$OUT_DIR/tf_rust" '*.nsp')"
+  need_file "$RUST_TF_MERGED_NSP"
+  pass_or_fail "tf_rust_merge_nsp_larger_than_update" "[[ \$(stat -c '%s' '$RUST_TF_MERGED_NSP') -gt \$(stat -c '%s' '$TF_UPD_FILE') ]]"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --ADVfilelist "$RUST_TF_MERGED_NSP" --keys "$KEYS" >"$OUT_DIR/logs/rust_tf_advfile.log" 2>&1
+  )
+  pass_or_fail "tf_rust_advfile_has_base_id" "rg -q 'CONTENT ID: 0100e750257a8000' '$OUT_DIR/logs/rust_tf_advfile.log'"
+  pass_or_fail "tf_rust_advfile_has_update_id" "rg -q 'CONTENT ID: 0100e750257a8800' '$OUT_DIR/logs/rust_tf_advfile.log'"
+  (
+    cd "$ROOT_DIR"
+    "${RUST_BIN[@]}" --splitter "$RUST_TF_MERGED_NSP" --ofolder "$OUT_DIR/cmp/tf_rust" --keys "$KEYS" >"$OUT_DIR/logs/tf_split_rust.log" 2>&1
+  )
+
+  if [[ "$HAVE_PY" -eq 1 ]]; then
+    (
+      cd "$PY_ZTOOLS"
+      "$PYTHON_BIN" squirrel.py -t nsp -tfile "$OUT_DIR/tf_merge_list.txt" -dmul calculate \
+        -o "$OUT_DIR/tf_py" -b 65536 \
+        >"$OUT_DIR/logs/py_tf_merge_nsp.log" 2>&1
+    )
+    PY_TF_MERGED_NSP="$(newest_file "$OUT_DIR/tf_py" '*.nsp')"
+    need_file "$PY_TF_MERGED_NSP"
+    if (
+      cd "$ROOT_DIR"
+      "${RUST_BIN[@]}" --splitter "$PY_TF_MERGED_NSP" --ofolder "$OUT_DIR/cmp/tf_py" --keys "$KEYS" >"$OUT_DIR/logs/tf_split_py.log" 2>&1
+    ); then
+      hash_nca_set "$OUT_DIR/cmp/tf_rust" "$OUT_DIR/cmp/tf_rust.sha"
+      hash_nca_set "$OUT_DIR/cmp/tf_py" "$OUT_DIR/cmp/tf_py.sha"
+      compare_hash_sets "$OUT_DIR/cmp/tf_rust.sha" "$OUT_DIR/cmp/tf_py.sha" "tf_merge_nsp_payload"
+    else
+      echo "tf_merge_nsp_python_reference_invalid: skip"
+    fi
   fi
 fi
 

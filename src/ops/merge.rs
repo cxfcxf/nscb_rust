@@ -658,6 +658,7 @@ fn build_nsp_output(
                     nsp_backing_by_name
                         .get(&nca.nca_name.to_ascii_lowercase())
                         .copied()
+                        .or(Some(*nca))
                 } else {
                     Some(*nca)
                 };
@@ -741,9 +742,6 @@ fn build_nsp_output(
                 uio::copy_section(&mut src, &mut out, cert.abs_offset, cert.size, Some(&pb))?;
             }
             Item::Xml(xml) => {
-                if python_direct_multi_mode && !xml.source_is_nsp_like {
-                    continue;
-                }
                 if let Some(bytes) = &xml.inline_data {
                     out.write_all(bytes)?;
                     pb.inc(bytes.len() as u64);
