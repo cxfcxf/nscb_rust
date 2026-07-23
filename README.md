@@ -70,7 +70,8 @@ target/release/nscb --help
 - `--keys <path>`: path to `prod.keys`
 - `-o, --ofolder <dir>`: output folder
 - `-t, --type <nsp|xci>`: target type for convert/merge output mode
-- `--level <1-22>`: compression level (default: `3`)
+- `--level <1-22>`: compression level (default: `12`)
+- `--threads <1-?>`: number of threads when compressing (default: `4`)
 - `-n, --nodelta`: exclude delta NCAs during merge
 - `--temp-dir <dir>`: store large temporary working files in this directory instead of the OS default temp directory
 
@@ -215,7 +216,8 @@ target/release/nscb \
 ```bash
 target/release/nscb \
   --compress "game.nsp" \
-  --level 3 \
+  --level 12 \
+  --threads 4 \
   --keys /path/to/prod.keys \
   -o /path/to/output
 ```
