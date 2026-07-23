@@ -127,9 +127,13 @@ pub struct Args {
     #[arg(long = "pv")]
     pub print_version: bool,
 
-    /// Compression level (1-22, default 3)
-    #[arg(long = "level", default_value = "3")]
+    /// Compression level (1-22)
+    #[arg(long = "level", default_value = "12")]
     pub level: i32,
+
+    /// Number of threads for compression (1-?)
+    #[arg(long = "threads", default_value = "4")]
+    pub threads: u32,
 
     /// I/O buffer size in bytes
     #[arg(long = "buffer", short = 'b')]
@@ -305,7 +309,7 @@ pub fn dispatch(args: Args) -> Result<()> {
         let ks = get_key_store(&mut key_store, args.keys.as_deref())?;
         let output = make_output_path(path, &args.ofolder, &compress_ext(path));
         return crate::ops::compress::compress_with_temp_dir(
-            path, &output, args.level, ks, temp_dir,
+            path, &output, args.level, args.threads, ks, temp_dir,
         );
     }
 

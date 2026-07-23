@@ -380,6 +380,7 @@ pub fn compress_nca<R: Read + Seek, W: Write + Seek>(
     nca_size: u64,
     sections: &[NczSection],
     compression_level: i32,
+    threads: u32,
     pb: Option<&ProgressBar>,
 ) -> Result<()> {
     let nca_base = reader.stream_position()?;
@@ -426,6 +427,10 @@ pub fn compress_nca<R: Read + Seek, W: Write + Seek>(
         let mut enc = zstd::stream::write::Encoder::new(writer, compression_level)
             .map_err(|e| NscbError::Crypto(format!("zstd encoder init error: {e}")))?;
         let mut pos = 0x4000u64;
+        
+        enc.multithread(threads) // Enable MT via the zstdmt feature
+            .map_err(|e| NscbError::Crypto(format!("zstd encoder multithread error: {e}")))?; 
+
         for s in &out_sections {
             if s.offset > pos {
                 stream_range(reader, &mut enc, nca_base, pos, s.offset - pos, None, pb)?;

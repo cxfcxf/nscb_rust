@@ -31,14 +31,15 @@ struct PackedSecureEntry {
 }
 
 /// Compress NSP to NSZ or XCI to XCZ.
-pub fn compress(input_path: &str, output_path: &str, level: i32, ks: &KeyStore) -> Result<()> {
-    compress_with_temp_dir(input_path, output_path, level, ks, None)
+pub fn compress(input_path: &str, output_path: &str, level: i32, threads: u32, ks: &KeyStore) -> Result<()> {
+    compress_with_temp_dir(input_path, output_path, level, threads, ks, None)
 }
 
 pub fn compress_with_temp_dir(
     input_path: &str,
     output_path: &str,
     level: i32,
+    threads: u32,
     ks: &KeyStore,
     temp_dir: Option<&Path>,
 ) -> Result<()> {
@@ -49,8 +50,8 @@ pub fn compress_with_temp_dir(
         .to_lowercase();
 
     match ext.as_str() {
-        "nsp" => compress_nsp(input_path, output_path, level, ks, temp_dir),
-        "xci" => compress_xci(input_path, output_path, level, ks, temp_dir),
+        "nsp" => compress_nsp(input_path, output_path, level, threads, ks, temp_dir),
+        "xci" => compress_xci(input_path, output_path, level, threads, ks, temp_dir),
         _ => Err(NscbError::UnsupportedFormat(format!(
             "Cannot compress {} files",
             ext
@@ -62,6 +63,7 @@ fn compress_nsp(
     input_path: &str,
     output_path: &str,
     level: i32,
+    threads: u32,
     ks: &KeyStore,
     temp_dir: Option<&Path>,
 ) -> Result<()> {
@@ -128,6 +130,7 @@ fn compress_nsp(
                 nca_size,
                 &sections,
                 level,
+                threads,
                 Some(&compress_pb),
             )?;
             compressed_files.push((ncz_name, tmp));
@@ -172,6 +175,7 @@ fn compress_xci(
     input_path: &str,
     output_path: &str,
     level: i32,
+    threads: u32,
     ks: &KeyStore,
     temp_dir: Option<&Path>,
 ) -> Result<()> {
@@ -259,6 +263,7 @@ fn compress_xci(
                 entry.size,
                 &sections,
                 level,
+                threads,
                 Some(&compress_pb),
             )?;
             let size = tmp.as_file().metadata()?.len();
